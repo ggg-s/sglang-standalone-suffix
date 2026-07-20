@@ -327,6 +327,7 @@ class FlashAttentionBackend(AttentionBackend):
         # latter by (batch_size, draft_token_num).
         self.target_verify_cuda_graph_state = {}
         self.target_verify_cuda_graph_metadata = {}
+        self.target_verify_ragged_cuda_graph_metadata = {}
         self.draft_extend_cuda_graph_state = {}
         self.draft_extend_cuda_graph_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -489,20 +490,48 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.spec_info
             )
             if self.topk <= 1:
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + draft_token_num
-                ).to(torch.int32)
-                metadata.max_seq_len_q = draft_token_num
-                metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item() + draft_token_num
+                ragged_widths = getattr(
+                    forward_batch.spec_info, "ragged_draft_token_nums", None
                 )
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * draft_token_num + 1,
-                    draft_token_num,
-                    dtype=torch.int32,
-                    device=device,
-                )
+                # Bounded ragged CUDA-graph replay pads every request to the
+                # captured maximum width. It reuses the normal fixed-K
+                # metadata and graph instead of requiring a graph for every
+                # possible number of K=8 rows.
+                if getattr(
+                    forward_batch.spec_info, "ragged_cuda_graph_padded", False
+                ):
+                    ragged_widths = None
+                if ragged_widths is not None:
+                    # FA3 natively supports a varlen query through
+                    # cu_seqlens_q.  This is used by mixed dynamic K=4/K=8
+                    # target verification and intentionally remains eager
+                    # until graph caching for ragged token counts is added.
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + ragged_widths
+                    ).to(torch.int32)
+                    # The ragged builder records the fixed maximum width, so
+                    # metadata setup does not need a GPU scalar readback.
+                    metadata.max_seq_len_q = draft_token_num
+                    metadata.max_seq_len_k = (
+                        forward_batch.seq_lens_cpu.max().item()
+                        + metadata.max_seq_len_q
+                    )
+                    metadata.cu_seqlens_q = forward_batch.spec_info.ragged_cu_seqlens_q
+                else:
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + draft_token_num
+                    ).to(torch.int32)
+                    metadata.max_seq_len_q = draft_token_num
+                    metadata.max_seq_len_k = (
+                        forward_batch.seq_lens_cpu.max().item() + draft_token_num
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * draft_token_num + 1,
+                        draft_token_num,
+                        dtype=torch.int32,
+                        device=device,
+                    )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
@@ -1390,6 +1419,12 @@ class FlashAttentionBackend(AttentionBackend):
                     "cache_seqlens": torch.zeros(
                         max_bs, dtype=torch.int32, device=self.device
                     ),
+                    # Fixed-K target verify builds cu_seqlens_q on capture.
+                    # Compact ragged CUDA graphs need a stable buffer because
+                    # their per-row query widths are replayed dynamically.
+                    "cu_seqlens_q": torch.zeros(
+                        max_bs + 1, dtype=torch.int32, device=self.device
+                    ),
                     "cu_seqlens_k": torch.zeros(
                         max_bs + 1, dtype=torch.int32, device=self.device
                     ),
@@ -1415,6 +1450,9 @@ class FlashAttentionBackend(AttentionBackend):
                         device=self.device,
                     ),
                     "cu_seqlens_k": torch.zeros(
+                        max_bs + 1, dtype=torch.int32, device=self.device
+                    ),
+                    "cu_seqlens_q": torch.zeros(
                         max_bs + 1, dtype=torch.int32, device=self.device
                     ),
                     "page_table": torch.zeros(
@@ -1631,6 +1669,23 @@ class FlashAttentionBackend(AttentionBackend):
                 target_verify_state = self.target_verify_cuda_graph_state[
                     draft_token_num
                 ]
+                if getattr(spec_info, "ragged_cuda_graph_varlen", False):
+                    key = spec_info.ragged_cuda_graph_pattern_key
+                    metadata.cache_seqlens_int32 = target_verify_state[
+                        "cache_seqlens"
+                    ][:bs]
+                    metadata.cache_seqlens_int32.copy_(
+                        seq_lens + spec_info.ragged_draft_token_nums
+                    )
+                    metadata.max_seq_len_q = draft_token_num
+                    metadata.max_seq_len_k = seq_lens.max().item() + draft_token_num
+                    metadata.cu_seqlens_q = target_verify_state["cu_seqlens_q"][: bs + 1]
+                    metadata.cu_seqlens_q.copy_(spec_info.ragged_cu_seqlens_q)
+                    metadata.cu_seqlens_k = target_verify_state["cu_seqlens_k"][: bs + 1]
+                    metadata.page_table = target_verify_state["page_table"][:bs, :]
+                    self.target_verify_ragged_cuda_graph_metadata[key] = metadata
+                    self.forward_metadata = metadata
+                    return
                 metadata.cache_seqlens_int32 = target_verify_state["cache_seqlens"][:bs]
                 metadata.cache_seqlens_int32.copy_((seq_lens + draft_token_num))
 
@@ -1852,6 +1907,30 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 draft_token_num = self._get_target_verify_draft_token_num(spec_info)
+                if getattr(spec_info, "ragged_cuda_graph_varlen", False):
+                    key = spec_info.ragged_cuda_graph_pattern_key
+                    metadata = self.target_verify_ragged_cuda_graph_metadata[key]
+                    metadata.cache_seqlens_int32.copy_(
+                        seq_lens + spec_info.ragged_draft_token_nums
+                    )
+                    metadata.cu_seqlens_q.copy_(spec_info.ragged_cu_seqlens_q)
+                    metadata.max_seq_len_k = seq_lens_cpu.max().item() + draft_token_num
+                    metadata.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        )
+                    )
+                    max_seq_pages = (
+                        metadata.max_seq_len_k + self.page_size - 1
+                    ) // self.page_size
+                    page_indices = self.req_to_token[
+                        req_pool_indices[:, None],
+                        self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                    ]
+                    page_indices //= self.page_size
+                    metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+                    self.forward_metadata = metadata
+                    return
                 metadata = self.target_verify_cuda_graph_metadata[(bs, draft_token_num)]
                 metadata.cache_seqlens_int32.copy_((seq_lens + draft_token_num))
 

@@ -317,6 +317,14 @@ class SchedulerOutputProcessorMixin:
                     result.suffix_long_request_count,
                     result.suffix_long_output_token_count,
                     result.suffix_long_draft_token_count,
+                    result.dynamic_k_verify_batch_count,
+                    result.dynamic_k_mixed_verify_batch_count,
+                    result.dynamic_k_normal_verify_call_count,
+                    result.dynamic_k_long_verify_call_count,
+                    result.dynamic_k_tier_request_counts or {},
+                    result.ragged_verify_cuda_graph_batch_count,
+                    result.ragged_verify_varlen_cuda_graph_batch_count,
+                    result.ragged_verify_eager_batch_count,
                 )
 
         self.token_to_kv_pool_allocator.free_group_begin()

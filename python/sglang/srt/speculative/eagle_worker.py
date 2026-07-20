@@ -1,7 +1,8 @@
-import logging
-import time
 import dataclasses
 import copy
+import logging
+import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -115,6 +116,25 @@ class EAGLEWorker(TpModelWorker):
         self._suffix_long_request_count = 0
         self._suffix_long_output_token_count = 0
         self._suffix_long_draft_token_count = 0
+        self._dynamic_k_verify_batch_count = 0
+        self._dynamic_k_mixed_verify_batch_count = 0
+        self._dynamic_k_normal_verify_call_count = 0
+        self._dynamic_k_long_verify_call_count = 0
+        self._dynamic_k_tier_request_counts: Dict[int, int] = {}
+        self._ragged_verify_cuda_graph_batch_count = 0
+        self._ragged_verify_varlen_cuda_graph_batch_count = 0
+        self._ragged_verify_eager_batch_count = 0
+        self._ragged_cuda_graph_min_long_ratio = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "SGLANG_RAGGED_CUDA_GRAPH_MIN_LONG_RATIO", "1.0"
+                    )
+                ),
+            ),
+        )
         self._dynamic_k_enable = (
             server_args.speculative_dynamic_k_enable
             and server_args.speculative_suffix_enable
@@ -131,6 +151,11 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_long_suffix_min_match_len
         )
         self._high_bs_threshold = server_args.speculative_high_bs_threshold
+        self._dynamic_k_tiers = self._parse_dynamic_k_tiers()
+        self._dynamic_k_batch_policy = self._parse_dynamic_k_batch_policy()
+        self._dynamic_k_high_batch_fallback = (
+            self._parse_dynamic_k_high_batch_fallback()
+        )
 
         if server_args.speculative_suffix_enable:
             self._init_suffix_proposer(target_worker)
@@ -307,6 +332,14 @@ class EAGLEWorker(TpModelWorker):
         self._suffix_long_request_count = 0
         self._suffix_long_output_token_count = 0
         self._suffix_long_draft_token_count = 0
+        self._dynamic_k_verify_batch_count = 0
+        self._dynamic_k_mixed_verify_batch_count = 0
+        self._dynamic_k_normal_verify_call_count = 0
+        self._dynamic_k_long_verify_call_count = 0
+        self._dynamic_k_tier_request_counts = {}
+        self._ragged_verify_cuda_graph_batch_count = 0
+        self._ragged_verify_varlen_cuda_graph_batch_count = 0
+        self._ragged_verify_eager_batch_count = 0
         if self._suffix_proposer:
             self._suffix_prepare_batch(batch)
 
@@ -365,6 +398,18 @@ class EAGLEWorker(TpModelWorker):
                 suffix_long_request_count=self._suffix_long_request_count,
                 suffix_long_output_token_count=self._suffix_long_output_token_count,
                 suffix_long_draft_token_count=self._suffix_long_draft_token_count,
+                dynamic_k_verify_batch_count=self._dynamic_k_verify_batch_count,
+                dynamic_k_mixed_verify_batch_count=self._dynamic_k_mixed_verify_batch_count,
+                dynamic_k_normal_verify_call_count=self._dynamic_k_normal_verify_call_count,
+                dynamic_k_long_verify_call_count=self._dynamic_k_long_verify_call_count,
+                dynamic_k_tier_request_counts=dict(
+                    self._dynamic_k_tier_request_counts
+                ),
+                ragged_verify_cuda_graph_batch_count=self._ragged_verify_cuda_graph_batch_count,
+                ragged_verify_varlen_cuda_graph_batch_count=(
+                    self._ragged_verify_varlen_cuda_graph_batch_count
+                ),
+                ragged_verify_eager_batch_count=self._ragged_verify_eager_batch_count,
             )
 
     def _get_num_verify_tokens(
@@ -372,6 +417,8 @@ class EAGLEWorker(TpModelWorker):
         batch_size: int,
         spec_info: Union[EagleVerifyInput, DynamicKVerifyInput],
     ) -> int:
+        if getattr(spec_info, "is_ragged_verify", lambda: False)():
+            return len(spec_info.draft_token)
         if isinstance(spec_info, DynamicKVerifyInput):
             total = 0
             if spec_info.normal is not None:
@@ -570,36 +617,131 @@ class EAGLEWorker(TpModelWorker):
             self._suffix_proposer = None
             return None
 
-    def _select_long_suffix_indices(
+    def _parse_dynamic_k_tiers(self) -> List[Tuple[int, int]]:
+        """Parse optional K:min_match tiers, e.g. ``8:7,16:15``.
+
+        The server arguments remain the compatibility default. Environment
+        configuration keeps the experimental multi-tier policy opt-in until
+        it has completed throughput and accuracy validation.
+        """
+        raw = os.environ.get("SGLANG_DYNAMIC_K_TIERS", "").strip()
+        if not raw:
+            return [
+                (
+                    self._long_suffix_draft_token_num,
+                    self._long_suffix_min_match_len,
+                )
+            ]
+        tiers: List[Tuple[int, int]] = []
+        for item in raw.split(","):
+            try:
+                width_text, match_text = item.strip().split(":", 1)
+                width, min_match = int(width_text), int(match_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_DYNAMIC_K_TIERS must be K:min_match pairs, "
+                    f"got {raw!r}"
+                ) from exc
+            if width <= self._normal_draft_token_num or min_match <= 0:
+                raise ValueError(
+                    "Dynamic-K tiers must be wider than normal K and have "
+                    f"positive match lengths, got {item!r}"
+                )
+            tiers.append((width, min_match))
+        if not tiers:
+            raise ValueError("SGLANG_DYNAMIC_K_TIERS cannot be empty")
+        return sorted(set(tiers))
+
+    def _parse_dynamic_k_batch_policy(self) -> List[Tuple[int, int]]:
+        """Parse optional max-batch:max-K policy, e.g. ``12:8,22:16``."""
+        raw = os.environ.get("SGLANG_DYNAMIC_K_BATCH_POLICY", "").strip()
+        if not raw:
+            return []
+        policy: List[Tuple[int, int]] = []
+        for item in raw.split(","):
+            try:
+                batch_text, width_text = item.strip().split(":", 1)
+                max_batch, max_width = int(batch_text), int(width_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_DYNAMIC_K_BATCH_POLICY must be "
+                    f"max_batch:max_K pairs, got {raw!r}"
+                ) from exc
+            if max_batch <= 0 or max_width < self._normal_draft_token_num:
+                raise ValueError(f"Invalid dynamic-K batch policy item {item!r}")
+            policy.append((max_batch, max_width))
+        return sorted(policy)
+
+    def _parse_dynamic_k_high_batch_fallback(self) -> Optional[Tuple[int, int]]:
+        """Parse an opt-in high-batch ``K:min_match`` fallback tier.
+
+        For example, ``8:8`` keeps K=4/16 below the configured batch
+        threshold, but uses suffix K=8 (instead of disabling dynamic K
+        entirely) when the active decode batch reaches that threshold.
+        """
+        raw = os.environ.get("SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK", "").strip()
+        if not raw:
+            return None
+        try:
+            width_text, match_text = raw.split(":", 1)
+            width, min_match = int(width_text), int(match_text)
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK must be K:min_match, "
+                f"got {raw!r}"
+            ) from exc
+        if width <= self._normal_draft_token_num or min_match <= 0:
+            raise ValueError(
+                "High-batch fallback must be wider than normal K and have a "
+                f"positive match length, got {raw!r}"
+            )
+        return width, min_match
+
+    def _max_dynamic_k_for_batch(self, batch_size: int) -> int:
+        for max_batch, max_width in self._dynamic_k_batch_policy:
+            if batch_size <= max_batch:
+                return max_width
+        if self._dynamic_k_batch_policy:
+            return self._normal_draft_token_num
+        return max(width for width, _ in self._dynamic_k_tiers)
+
+    def _select_suffix_draft_token_nums(
         self,
         batch: ScheduleBatch,
         proposals: Optional[List[Optional[SuffixProposal]]],
-    ) -> List[int]:
+    ) -> Dict[int, int]:
         if not self._dynamic_k_enable or not proposals:
-            return []
+            return {}
         if batch.return_logprob or batch.has_grammar:
-            return []
+            return {}
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            return []
+            return {}
         bs = batch.batch_size()
         if bs >= self._high_bs_threshold:
-            return []
-
-        indices: List[int] = []
-        required_tokens = self._long_suffix_draft_token_num - 1
+            if self._dynamic_k_high_batch_fallback is None:
+                return {}
+            eligible_tiers = [self._dynamic_k_high_batch_fallback]
+        else:
+            max_width = self._max_dynamic_k_for_batch(bs)
+            eligible_tiers = [
+                tier for tier in self._dynamic_k_tiers if tier[0] <= max_width
+            ]
+        selected: Dict[int, int] = {}
         for idx, proposal in enumerate(proposals):
             if proposal is None:
                 continue
-            if proposal.match_len < self._long_suffix_min_match_len:
-                continue
-            if proposal.score < required_tokens:
-                continue
-            if len(proposal.token_ids) < required_tokens:
-                continue
-            indices.append(idx)
+            for width, min_match in reversed(eligible_tiers):
+                required_tokens = width - 1
+                if proposal.match_len < min_match:
+                    continue
+                if proposal.score < required_tokens:
+                    continue
+                if len(proposal.token_ids) < required_tokens:
+                    continue
+                selected[idx] = width
+                break
 
-        self._suffix_long_request_count = len(indices)
-        return indices
+        return selected
 
     def _build_linear_suffix_verify_input(
         self,
@@ -723,6 +865,133 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=seq_lens.sum().item(),
             seq_lens_cpu=seq_lens_cpu,
+        )
+
+    def _build_ragged_verify_input(
+        self,
+        batch: ScheduleBatch,
+        parent_list: torch.Tensor,
+        top_scores_index: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        proposals: List[Optional[SuffixProposal]],
+        suffix_draft_token_nums: Dict[int, int],
+    ) -> EagleVerifyInput:
+        """Build one FA3 varlen verify input for mixed dynamic-K requests.
+
+        ``build_tree_kernel_efficient`` represents a fixed-width tree.  This
+        path is deliberately restricted to topk=1, where each request is a
+        causal chain and FA3 can consume the flattened variable-length query
+        using ``cu_seqlens_q``.
+        """
+        del parent_list, top_scores_index
+        assert self.topk == 1
+        device = batch.seq_lens.device
+        bs = batch.batch_size()
+        normal_k = self._normal_draft_token_num
+        max_k = max(normal_k, *suffix_draft_token_nums.values())
+        long_suffix_indices = list(suffix_draft_token_nums)
+        long_mask = torch.zeros(bs, dtype=torch.bool, device=device)
+        long_mask[long_suffix_indices] = True
+        widths = torch.full(
+            (bs,), normal_k, dtype=batch.seq_lens.dtype, device=device
+        )
+        for req_idx, width in suffix_draft_token_nums.items():
+            widths[req_idx] = width
+
+        # The first token is the previously verified token.  Normal rows use
+        # the draft-model chain; long rows replace the remaining tokens with
+        # suffix candidates.
+        padded_tokens = torch.full(
+            (bs, max_k), -1, dtype=batch.spec_info.verified_id.dtype, device=device
+        )
+        padded_tokens[:, 0] = batch.spec_info.verified_id
+        padded_tokens[:, 1:normal_k] = draft_tokens[:, : normal_k - 1]
+        for req_idx, width in suffix_draft_token_nums.items():
+            proposal = proposals[req_idx]
+            assert proposal is not None
+            padded_tokens[req_idx, 1:width] = torch.tensor(
+                proposal.token_ids[: width - 1],
+                dtype=padded_tokens.dtype,
+                device=device,
+            )
+
+        column_ids = torch.arange(max_k, device=device)
+        valid_mask = column_ids.unsqueeze(0) < widths.unsqueeze(1)
+        draft_token = padded_tokens[valid_mask]
+        positions = (
+            batch.seq_lens.unsqueeze(1).to(torch.long) + column_ids
+        )[valid_mask]
+        ragged_cu_seqlens_q = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(widths, dim=0, dtype=torch.int32),
+            ]
+        )
+        padded_to_flat = torch.full(
+            (bs, max_k), -1, dtype=torch.long, device=device
+        )
+        padded_to_flat[valid_mask] = torch.arange(
+            draft_token.numel(), dtype=torch.long, device=device
+        )
+
+        # Tree verification still uses a rectangular index table.  For a
+        # topk=1 chain each node has at most one child; its actual model-token
+        # location is recovered through ``padded_to_flat`` during verify.
+        padded_indices = torch.arange(
+            bs * max_k, dtype=torch.long, device=device
+        ).view(bs, max_k)
+        retrive_index = torch.full_like(padded_indices, -1)
+        retrive_index[valid_mask] = padded_indices[valid_mask]
+        retrive_next_token = torch.full_like(padded_indices, -1)
+        has_next = column_ids.unsqueeze(0) + 1 < widths.unsqueeze(1)
+        retrive_next_token[has_next] = (
+            column_ids.unsqueeze(0).expand(bs, -1)[has_next] + 1
+        )
+        retrive_next_sibling = torch.full_like(padded_indices, -1)
+
+        return EagleVerifyInput(
+            draft_token=draft_token,
+            custom_mask=torch.empty((0,), dtype=torch.bool, device=device),
+            positions=positions,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=max_k - 1,
+            topk=self.topk,
+            draft_token_num=max_k,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=batch.seq_lens.sum().item(),
+            seq_lens_cpu=batch.seq_lens_cpu,
+            ragged_draft_token_nums=widths,
+            ragged_cu_seqlens_q=ragged_cu_seqlens_q,
+            ragged_padded_to_flat=padded_to_flat,
+            ragged_long_suffix_mask=long_mask,
+            ragged_long_suffix_count=len(long_suffix_indices),
+            ragged_cuda_graph_eligible=(
+                len(set(suffix_draft_token_nums.values())) == 1
+                and next(iter(suffix_draft_token_nums.values()))
+                == self._long_suffix_draft_token_num
+            ),
+        )
+
+    def _can_use_ragged_dynamic_k(
+        self,
+        batch: ScheduleBatch,
+        suffix_draft_token_nums: Dict[int, int],
+    ) -> bool:
+        return (
+            self._dynamic_k_enable
+            and self.server_args.attention_backend == "fa3"
+            and self.page_size == 1
+            and self.topk == 1
+            and len(suffix_draft_token_nums) > 0
+            and not batch.return_logprob
+            and not batch.has_grammar
+            and (
+                batch.sampling_info is None
+                or batch.sampling_info.is_all_greedy
+            )
         )
 
     def _make_sub_batch(self, batch: ScheduleBatch, indices: List[int]) -> ScheduleBatch:
@@ -1085,8 +1354,31 @@ class EAGLEWorker(TpModelWorker):
             )
 
         proposals = self._get_suffix_proposals(batch)
-        long_suffix_indices = self._select_long_suffix_indices(batch, proposals)
-        long_suffix_set = set(long_suffix_indices)
+        suffix_draft_token_nums = self._select_suffix_draft_token_nums(
+            batch, proposals
+        )
+        use_ragged_dynamic_k = self._can_use_ragged_dynamic_k(
+            batch, suffix_draft_token_nums
+        )
+        # A mixed K=4/K=8 batch needs two serial target verify forwards and a
+        # merge.  The measured split overhead is larger than the K=8 benefit
+        # for the current 10--24 concurrency workload.  Keep a single target
+        # verify forward unless every request in this batch qualifies for the
+        # long suffix path.  Requests that fall back here can still receive a
+        # regular K=4 suffix override below.
+        if (
+            not use_ragged_dynamic_k
+            and (
+                0 < len(suffix_draft_token_nums) < batch.batch_size()
+                or any(
+                    width != self._long_suffix_draft_token_num
+                    for width in suffix_draft_token_nums.values()
+                )
+            )
+        ):
+            suffix_draft_token_nums = {}
+        long_suffix_indices = list(suffix_draft_token_nums)
+        long_suffix_set = set(suffix_draft_token_nums)
         self._apply_suffix_overrides(
             batch,
             parent_list,
@@ -1095,6 +1387,29 @@ class EAGLEWorker(TpModelWorker):
             proposals=proposals,
             skip_indices=long_suffix_set,
         )
+
+        if use_ragged_dynamic_k:
+            assert proposals is not None
+            tier_counts = {
+                width: sum(
+                    selected_width == width
+                    for selected_width in suffix_draft_token_nums.values()
+                )
+                for width in sorted(set(suffix_draft_token_nums.values()))
+            }
+            self._last_suffix_status = (
+                "ragged-dynamic-k "
+                + ",".join(f"k{width}={count}" for width, count in tier_counts.items())
+                + f" normal={batch.batch_size() - len(long_suffix_indices)}"
+            )
+            return self._build_ragged_verify_input(
+                batch,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                proposals,
+                suffix_draft_token_nums,
+            )
 
         normal_indices = [
             i for i in range(batch.batch_size()) if i not in long_suffix_set
@@ -1119,6 +1434,9 @@ class EAGLEWorker(TpModelWorker):
                 long_suffix_indices,
                 self._long_suffix_draft_token_num,
             )
+            # Keep the long-suffix marker on the verify input so that the
+            # common verify path counts long-only and mixed batches alike.
+            long_suffix_input._is_dynamic_k_long_suffix = True
             self._last_suffix_status = (
                 f"dynamic-k long={len(long_suffix_indices)} normal={len(normal_indices)}"
             )
@@ -1131,6 +1449,7 @@ class EAGLEWorker(TpModelWorker):
                 long_suffix_indices=long_suffix_indices,
             )
         if long_suffix_input is not None:
+            long_suffix_input._is_dynamic_k_long_only = True
             return long_suffix_input
         assert normal_input is not None
         return normal_input
@@ -1219,6 +1538,7 @@ class EAGLEWorker(TpModelWorker):
         if isinstance(spec_info, DynamicKVerifyInput):
             return self._verify_dynamic_k(batch, spec_info)
 
+        self._maybe_enable_ragged_cuda_graph_padding(batch, spec_info)
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -1281,6 +1601,56 @@ class EAGLEWorker(TpModelWorker):
             vocab_mask,
         )
 
+        if spec_info.is_ragged_verify():
+            # A ragged batch issues one FA3 target forward even when it
+            # contains both K=4 and K=8 requests. Keep the historical
+            # mixed-batch counter at zero: it specifically measures the old
+            # split-into-two-forwards implementation.
+            self._dynamic_k_verify_batch_count += 1
+            self._dynamic_k_long_verify_call_count += 1
+            if can_run_cuda_graph:
+                self._ragged_verify_cuda_graph_batch_count += 1
+                if getattr(spec_info, "ragged_cuda_graph_varlen", False):
+                    self._ragged_verify_varlen_cuda_graph_batch_count += 1
+            else:
+                self._ragged_verify_eager_batch_count += 1
+            if self._long_suffix_draft_token_num > self._normal_draft_token_num:
+                long_mask = spec_info.ragged_long_suffix_mask.tolist()
+                widths = spec_info.ragged_draft_token_nums.tolist()
+                for width, is_long in zip(widths, long_mask):
+                    if is_long:
+                        self._dynamic_k_tier_request_counts[width] = (
+                            self._dynamic_k_tier_request_counts.get(width, 0) + 1
+                        )
+                self._suffix_long_request_count += sum(long_mask)
+                self._suffix_long_output_token_count += sum(
+                    int(accept_length) + 1
+                    for accept_length, is_long in zip(
+                        res.accept_length_per_req_cpu, long_mask
+                    )
+                    if is_long
+                )
+                self._suffix_long_draft_token_count += sum(
+                    width for width, is_long in zip(widths, long_mask) if is_long
+                )
+
+        # This path is shared by a long-only dynamic batch and the long half
+        # of a mixed K=4/K=8 batch. Integer counters avoid CUDA events or
+        # synchronizations in the hot path.
+        elif getattr(spec_info, "_is_dynamic_k_long_suffix", False):
+            if getattr(spec_info, "_is_dynamic_k_long_only", False):
+                self._dynamic_k_verify_batch_count += 1
+            if spec_info.draft_token_num > self._normal_draft_token_num:
+                self._suffix_long_request_count += batch.batch_size()
+                self._suffix_long_output_token_count += sum(
+                    int(accept_length) + 1
+                    for accept_length in res.accept_length_per_req_cpu
+                )
+                self._suffix_long_draft_token_count += (
+                    batch.batch_size() * spec_info.draft_token_num
+                )
+            self._dynamic_k_long_verify_call_count += 1
+
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
@@ -1340,11 +1710,48 @@ class EAGLEWorker(TpModelWorker):
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
+    def _maybe_enable_ragged_cuda_graph_padding(
+        self, batch: ScheduleBatch, spec_info: EagleVerifyInput
+    ) -> None:
+        """Pad high-K8-coverage ragged batches onto the existing K=8 graph."""
+        if not getattr(spec_info, "is_ragged_verify", lambda: False)():
+            return
+        if not getattr(spec_info, "ragged_cuda_graph_eligible", True):
+            return
+        if self._long_suffix_draft_token_num <= self._normal_draft_token_num:
+            return
+        long_count = spec_info.ragged_long_suffix_count
+        graph_runner = getattr(self.target_worker.model_runner, "graph_runner", None)
+        # Prefer an exact compact graph pattern. It keeps the flattened
+        # variable-length Q tensor and real cu_seqlens_q; no K=4 tail is
+        # padded to K=8.
+        if graph_runner is not None and graph_runner.can_run_ragged_varlen_target_verify(
+            batch.batch_size(), long_count
+        ):
+            spec_info.ragged_cuda_graph_varlen = True
+            spec_info.ragged_cuda_graph_pattern_key = (
+                batch.batch_size(),
+                long_count,
+            )
+            return
+        min_long_ratio = getattr(self, "_ragged_cuda_graph_min_long_ratio", 1.0)
+        if long_count / batch.batch_size() < min_long_ratio:
+            return
+        if graph_runner is None or not graph_runner.can_run_ragged_target_verify(
+            batch.batch_size(), spec_info.draft_token_num
+        ):
+            return
+        spec_info.ragged_cuda_graph_padded = True
+
     def _verify_dynamic_k(
         self, batch: ScheduleBatch, spec_info: DynamicKVerifyInput
     ):
         results = []
+        self._dynamic_k_verify_batch_count += 1
+        if spec_info.normal is not None and spec_info.long_suffix is not None:
+            self._dynamic_k_mixed_verify_batch_count += 1
         if spec_info.normal is not None and spec_info.normal_indices:
+            self._dynamic_k_normal_verify_call_count += 1
             normal_batch = self._make_sub_batch(batch, spec_info.normal_indices)
             logits_output, verify_output, _, can_run_cuda_graph = self.verify(
                 normal_batch, spec_info.normal
@@ -1365,14 +1772,6 @@ class EAGLEWorker(TpModelWorker):
                 suffix_batch, spec_info.long_suffix
             )
             verify_output.can_run_cuda_graph = can_run_cuda_graph
-            self._suffix_long_output_token_count += sum(
-                int(accept_length) + 1
-                for accept_length in verify_output.accept_length_per_req_cpu
-            )
-            self._suffix_long_draft_token_count += (
-                len(spec_info.long_suffix_indices)
-                * spec_info.long_suffix.draft_token_num
-            )
             results.append(
                 (
                     spec_info.long_suffix_indices,

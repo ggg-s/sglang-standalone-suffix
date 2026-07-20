@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -48,6 +49,17 @@ class StandaloneWorker(EAGLEWorker):
         # dynamic-K state explicitly instead of relying on EAGLEWorker.__init__.
         self._suffix_proposer = None
         self._last_suffix_status = None
+        self._ragged_cuda_graph_min_long_ratio = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "SGLANG_RAGGED_CUDA_GRAPH_MIN_LONG_RATIO", "1.0"
+                    )
+                ),
+            ),
+        )
         self._dynamic_k_enable = (
             server_args.speculative_dynamic_k_enable
             and server_args.speculative_suffix_enable
@@ -64,6 +76,13 @@ class StandaloneWorker(EAGLEWorker):
             server_args.speculative_long_suffix_min_match_len
         )
         self._high_bs_threshold = server_args.speculative_high_bs_threshold
+        # Standalone bypasses EAGLEWorker.__init__, so it must also own the
+        # opt-in multi-tier dynamic-K configuration.
+        self._dynamic_k_tiers = self._parse_dynamic_k_tiers()
+        self._dynamic_k_batch_policy = self._parse_dynamic_k_batch_policy()
+        self._dynamic_k_high_batch_fallback = (
+            self._parse_dynamic_k_high_batch_fallback()
+        )
         if server_args.speculative_suffix_enable:
             self._init_suffix_proposer(target_worker)
 

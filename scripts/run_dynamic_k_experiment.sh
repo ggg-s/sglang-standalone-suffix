@@ -14,6 +14,10 @@
 #   GPU_IDS=0,1,2,3 TP_SIZE=4 PORT=30000 \
 #   DATASET_PATH=donghuayiwei_fixed.jsonl \
 #   bash scripts/run_dynamic_k_experiment.sh
+#
+# Minimal compact-varlen graph smoke test (only starts the actual K=4/8 server):
+#   SGLANG_RAGGED_VARLEN_CUDA_GRAPH_PATTERNS=10:5 \
+#   EXPERIMENTS=dynamic_k4_k8 bash scripts/run_dynamic_k_experiment.sh
 
 set -Eeuo pipefail
 
@@ -34,17 +38,26 @@ GPU_IDS="${GPU_IDS:-}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.72}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-fa3}"
+# Threshold 24 was the best measured throughput-oriented policy on 2026-07-17.
+# Override it for a latency-oriented deployment or further threshold sweeps.
+HIGH_BS_THRESHOLD="${HIGH_BS_THRESHOLD:-24}"
+DYNAMIC_LONG_DRAFT_TOKENS="${DYNAMIC_LONG_DRAFT_TOKENS:-8}"
+DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN="${DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN:-7}"
+DYNAMIC_EXPERIMENT_NAME="${DYNAMIC_EXPERIMENT_NAME:-dynamic_k4_k8}"
 PRELOAD_LIBSTDCXX="${PRELOAD_LIBSTDCXX:-/usr/lib/x86_64-linux-gnu/libstdc++.so.6}"
 
 # The measured workload is kept identical to the command supplied by the user.
-MEASURE_PROMPTS=( ${MEASURE_PROMPTS:-40 80 96 120} )
-MEASURE_CONCURRENCY=( ${MEASURE_CONCURRENCY:-10 20 24 30} )
+MEASURE_PROMPTS=( ${MEASURE_PROMPTS:-40 80 96} )
+MEASURE_CONCURRENCY=( ${MEASURE_CONCURRENCY:-10 20 24} )
 WARMUP_PROMPTS="${WARMUP_PROMPTS:-120}"
 WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-8}"
 FIXED_OUTPUT_LEN="${FIXED_OUTPUT_LEN:-2048}"
 SHUFFLE="${SHUFFLE:-0}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-900}"
 RESULTS_DIR="${RESULTS_DIR:-${SPEC_FORGE_DIR}/results/dynamic_k_$(date +%Y%m%d_%H%M%S)}"
+# A space-separated subset of: no_speculation, standalone_k4, suffix_static_k4,
+# dynamic_k4_k4, dynamic_k4_k8.  Keeping the default preserves the full A/B run.
+EXPERIMENTS="${EXPERIMENTS:-no_speculation standalone_k4 suffix_static_k4 dynamic_k4_k4 dynamic_k4_k8}"
 
 SERVER_PID=""
 
@@ -66,6 +79,17 @@ cleanup_server() {
 
 trap cleanup_server EXIT INT TERM
 
+should_run_experiment() {
+    local experiment="$1"
+    local selected
+    for selected in ${EXPERIMENTS}; do
+        if [[ "${selected}" == "${experiment}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 wait_for_server() {
     local deadline=$((SECONDS + SERVER_START_TIMEOUT))
     while (( SECONDS < deadline )); do
@@ -85,19 +109,25 @@ wait_for_server() {
 snapshot_metrics() {
     local name="$1"
     curl --fail --silent --show-error "${CLIENT_BASE_URL}/metrics" > "${CURRENT_DIR}/metrics_${name}.prom"
-    grep -E '^sglang:(suffix_|dynamic_k8_|spec_accept_)' "${CURRENT_DIR}/metrics_${name}.prom" \
+    grep -E '^sglang:(suffix_|dynamic_k|ragged_|spec_accept_)' "${CURRENT_DIR}/metrics_${name}.prom" \
         > "${CURRENT_DIR}/metrics_${name}_focus.prom" || true
 }
 
 run_client() {
     local log_file="$1"
     shift
+    local stage_dir="${CURRENT_DIR}/${log_file%.log}_artifacts"
+    local resolved_dataset_path="${DATASET_PATH}"
+    if [[ "${resolved_dataset_path}" != /* ]]; then
+        resolved_dataset_path="${SPEC_FORGE_DIR}/${resolved_dataset_path}"
+    fi
+    mkdir -p "${stage_dir}"
     local args=(
-        python ./test_req.py
+        python "${TEST_SCRIPT}"
         --base-url "${CLIENT_BASE_URL}"
         --model "${MODEL_PATH}"
         --dataset-name "${DATASET_NAME}"
-        --dataset-path "${DATASET_PATH}"
+        --dataset-path "${resolved_dataset_path}"
         --tokenizer-path "${TOKENIZER_PATH}"
         --temperature 0.0
         --fixed-output-len "${FIXED_OUTPUT_LEN}"
@@ -108,7 +138,7 @@ run_client() {
     fi
     args+=("$@")
     (
-        cd "${SPEC_FORGE_DIR}"
+        cd "${stage_dir}"
         "${args[@]}"
     ) 2>&1 | tee "${CURRENT_DIR}/${log_file}"
 }
@@ -170,10 +200,19 @@ run_experiment() {
         --max-concurrency "${WARMUP_CONCURRENCY}"
     snapshot_metrics "after_k8_probe"
 
-    run_client "measurement.log" \
-        --num-prompts "${MEASURE_PROMPTS[@]}" \
-        --max-concurrency "${MEASURE_CONCURRENCY[@]}"
-    snapshot_metrics "after_measurement"
+    if [[ "${#MEASURE_PROMPTS[@]}" -ne "${#MEASURE_CONCURRENCY[@]}" ]]; then
+        echo "MEASURE_PROMPTS and MEASURE_CONCURRENCY must have the same length" >&2
+        return 1
+    fi
+    local i
+    for i in "${!MEASURE_CONCURRENCY[@]}"; do
+        local concurrency="${MEASURE_CONCURRENCY[$i]}"
+        local prompts="${MEASURE_PROMPTS[$i]}"
+        run_client "measurement_bs${concurrency}_n${prompts}.log" \
+            --num-prompts "${prompts}" \
+            --max-concurrency "${concurrency}"
+        snapshot_metrics "after_measurement_bs${concurrency}"
+    done
 
     cleanup_server
 }
@@ -187,7 +226,10 @@ Dynamic-K experiment results
 ============================
 
 Each configuration has a server.log, warmup.log, k8_probe.log,
-measurement.log, and Prometheus snapshots.
+per-concurrency measurement logs, Prometheus snapshots, and isolated CSV
+artifacts under *_artifacts/.
+
+Dynamic-K policy: HIGH_BS_THRESHOLD=${HIGH_BS_THRESHOLD}
 
 Interpret the counters in metrics_after_k8_probe_focus.prom (filter tp_rank="0"):
   sglang:dynamic_k8_request_total
@@ -195,6 +237,14 @@ Interpret the counters in metrics_after_k8_probe_focus.prom (filter tp_rank="0")
   sglang:dynamic_k8_output_token_total / sglang:dynamic_k8_draft_token_total
       K=8 target verification efficiency. A value near 1 is strong; a low
       value means long suffix candidates are being rejected.
+  sglang:ragged_verify_cuda_graph_batch_total /
+  (sglang:ragged_verify_cuda_graph_batch_total +
+   sglang:ragged_verify_eager_batch_total)
+      Ragged target-verify CUDA-graph hit rate. High-K=8-coverage mixed
+      batches reuse the fixed-K=8 graph; low-coverage batches remain eager.
+  sglang:ragged_verify_varlen_cuda_graph_batch_total
+      Must increase to prove replay of the compact true-varlen graph selected
+      through SGLANG_RAGGED_VARLEN_CUDA_GRAPH_PATTERNS (not the old padding graph).
   sglang:suffix_override_total / sglang:suffix_proposal_total
       Fraction of suffix proposals that were strong enough to replace K=4
       standalone draft tokens.
@@ -202,25 +252,35 @@ Interpret the counters in metrics_after_k8_probe_focus.prom (filter tp_rank="0")
 Primary comparisons:
   standalone_k4 vs no_speculation: standalone speculative-decoding benefit.
   suffix_static_k4 vs standalone_k4: suffix-cache net benefit/cost.
-  dynamic_k4_k8 vs suffix_static_k4: dynamic-K net benefit. Use k8_probe
-  (concurrency 8) for this comparison; batches >=20 intentionally disable K=8.
+  dynamic_k4_k4 vs suffix_static_k4: dynamic-K classifier/control overhead.
+  dynamic_k4_k8 vs dynamic_k4_k4: net value of widening long suffix to K=8
+  with one FA3 ragged target forward (on supported mixed batches).
+  dynamic_k4_k8 vs suffix_static_k4: overall dynamic-K net benefit. Use the
+  individual measurement_bs10, measurement_bs20, and measurement_bs24 results.
 EOF
 
-run_experiment "no_speculation"
-run_experiment "standalone_k4" \
+if should_run_experiment "no_speculation"; then
+    run_experiment "no_speculation"
+fi
+if should_run_experiment "standalone_k4"; then
+    run_experiment "standalone_k4" \
     --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
     --speculative-algorithm STANDALONE \
     --speculative-num-steps 3 \
     --speculative-num-draft-tokens 4 \
     --speculative-eagle-topk 1
-run_experiment "suffix_static_k4" \
+fi
+if should_run_experiment "suffix_static_k4"; then
+    run_experiment "suffix_static_k4" \
     --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
     --speculative-algorithm STANDALONE \
     --speculative-num-steps 3 \
     --speculative-num-draft-tokens 4 \
     --speculative-eagle-topk 1 \
     --speculative-suffix-enable
-run_experiment "dynamic_k4_k8" \
+fi
+if should_run_experiment "dynamic_k4_k4"; then
+    run_experiment "dynamic_k4_k4" \
     --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
     --speculative-algorithm STANDALONE \
     --speculative-num-steps 3 \
@@ -229,9 +289,24 @@ run_experiment "dynamic_k4_k8" \
     --speculative-suffix-enable \
     --speculative-dynamic-k-enable \
     --speculative-normal-draft-token-num 4 \
-    --speculative-long-suffix-draft-token-num 8 \
+    --speculative-long-suffix-draft-token-num 4 \
     --speculative-long-suffix-min-match-len 7 \
-    --speculative-high-bs-threshold 20
+    --speculative-high-bs-threshold "${HIGH_BS_THRESHOLD}"
+fi
+if should_run_experiment "${DYNAMIC_EXPERIMENT_NAME}"; then
+    run_experiment "${DYNAMIC_EXPERIMENT_NAME}" \
+    --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
+    --speculative-algorithm STANDALONE \
+    --speculative-num-steps 3 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-suffix-enable \
+    --speculative-dynamic-k-enable \
+    --speculative-normal-draft-token-num 4 \
+    --speculative-long-suffix-draft-token-num "${DYNAMIC_LONG_DRAFT_TOKENS}" \
+    --speculative-long-suffix-min-match-len "${DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN}" \
+    --speculative-high-bs-threshold "${HIGH_BS_THRESHOLD}"
+fi
 
 python "${SGLANG_DIR}/scripts/summarize_dynamic_k_experiment.py" "${RESULTS_DIR}" \
     | tee "${RESULTS_DIR}/dynamic_k_metric_summary.tsv"

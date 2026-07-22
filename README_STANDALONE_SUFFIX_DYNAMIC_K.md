@@ -372,10 +372,45 @@ for three fresh-server repeats by default, across concurrency 10/20/24/30.
 `final_ab_summary.md` reports median throughput, TTFT, TPOT, and per-phase
 TP0 K=8/K=16 tier coverage.
 
-**Final alternating A/B result (2026-07-20).** Three fresh-server,
-alternating runs completed at `final_dynamic_k_ab_20260720_213528`. This is
-the final throughput validation of the deployable policy, using the same FA3,
-TP=4, 2,048-output-token workload and external concurrency 10/20/24/30.
+For full end-to-end attribution, use
+`scripts/run_full_stack_final_policy_validation.sh`. It cyclically compares
+target-only inference, fixed Standalone K=4, ArcticInference suffix fusion
+with static K=4, and the final dynamic K=4/16/8 policy. Its
+`full_stack_summary.md` separates fixed-speculation, suffix-fusion,
+dynamic-K, and total gains.
+
+### Optional SRI forest suffix backend
+
+The default `arctic` suffix backend remains unchanged. For an experiment with
+an SRI-style C++ suffix-path store and a second stable dataset tree, build the
+optional extension manually in the serving environment:
+
+```bash
+cd /workspace/sglang-standalone-suffix
+bash scripts/build_sri_suffix_tree.sh
+PYTHONPATH=/workspace/sglang-standalone-suffix/python \
+  pytest -q test/srt/test_sri_forest_cache.py
+```
+
+Then add `--speculative-suffix-backend sri_forest` and, for example,
+`--speculative-suffix-dataset-cache-max-requests 256` to the existing
+Standalone+suffix launch command. `0` disables the added dataset tree. The
+SRI backend keeps the existing dynamic K=4/16/8 and FA3 ragged verifier, and
+only changes suffix proposal/cache selection. Metrics expose
+`sglang:suffix_proposal_source_total{source="local|global|dataset"}`; compare
+dataset `0` versus a positive capacity to measure the extra tree's coverage.
+The one-command A/B harness is
+`scripts/run_sri_forest_dataset_tree_experiment.sh`; it compares the existing
+Arctic cache, SRI global-only forest, and SRI forest plus dataset tree under
+the final dynamic K=4/16/8 policy, then writes
+`sri_dataset_tree_summary.md`.
+
+**Sequential continuous-cache A/B result (2026-07-20).** Three fresh-server,
+alternating policy runs completed at `final_dynamic_k_ab_20260720_213528`.
+Within each server, however, measurement order was 10 -> 20 -> 24 -> 30, so
+later phases also saw suffix entries produced by earlier measurement phases.
+This measures the throughput of a continuously serving cache, not the
+isolated effect of external concurrency.
 
 | Concurrency | Fixed K=4 median tok/s | Final policy median tok/s | Throughput uplift | Fixed / dynamic TTFT | Fixed / dynamic TPOT |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -387,11 +422,9 @@ TP=4, 2,048-output-token workload and external concurrency 10/20/24/30.
 Tier counters prove the policy routed exactly as intended in every repeat:
 K=8 was zero at concurrency 10/20 and 4,485--4,633 / 6,976--7,454 selected
 rows at 24 / 30; K=16 was then dominant at 10/20 and remained only for
-high-batch tails below active batch 24. The final policy is therefore the
-throughput deployment default. It improves TPOT at every tested concurrency,
-but it increases TTFT at 10, 24, and 30 (especially under saturation), so a
-strict TTFT SLO should use the fixed-K=4 baseline or apply admission control
-rather than treating this as a latency-only optimization.
+high-batch tails below active batch 24. These results remain useful for a
+continuously serving cache, but must not be used to claim that concurrency 20
+is intrinsically the algorithmic sweet spot.
 
 Raw-run stability checks were also completed: every one of the 12
 per-concurrency A/B pairs returned all requests successfully and had positive
@@ -401,6 +434,49 @@ dynamic-policy throughput deltas. The observed three-run uplift ranges were
 P95 TTFT increased from 11,933.04 ms to 13,036.64 ms (+1.10 s, about 9.2%).
 At concurrency 30 the corresponding P95 median changed from 17,945.90 ms to
 18,422.58 ms (+0.48 s, about 2.7%).
+
+**Order-controlled final validation (2026-07-21).** To remove measurement
+order as a cache confounder, concurrency 20, 24, and 30 were each measured in
+their own three-repeat alternating A/B run at
+`order_control_20_24_30_20260721_003343`. Every isolated server received the
+same warmup and K=8 probe, then measured only one external concurrency.
+
+| Concurrency | Fixed K=4 median tok/s | Final policy median tok/s | Throughput uplift | Fixed / dynamic TTFT | Fixed / dynamic TPOT |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20 | 353.84 | 368.01 | **+4.00%** | 3215.82 / 3334.69 ms | 53.62 / 52.61 ms |
+| 24 | 365.67 | 394.22 | **+7.81%** | 3695.05 / 3826.60 ms | 66.56 / 62.54 ms |
+| 30 | 355.22 | 371.82 | **+4.67%** | 7411.06 / 8400.01 ms | 78.75 / 77.26 ms |
+
+The policy branches were stable in every isolated repeat: at concurrency 20
+K=8 was zero and K=16 selected 1,714--1,763 rows; at 24 K=8 selected
+4,302--4,442 rows; at 30 K=8 selected 6,203--6,330 rows. This is the
+authoritative comparison for cold/equally warmed servers. It proves positive
+throughput benefit at all tested high-concurrency points, but identifies 24,
+not 20, as the strongest isolated result. The higher sequential-cache 20
+result is a valid steady-state cache outcome, rather than a pure concurrency
+effect.
+
+**Full-stack attribution result (2026-07-21).** Four cyclic fresh-server
+rounds completed at `full_stack_final_20260721_101502`. This is the complete
+same-workload comparison from target-only inference through the final policy:
+
+| Concurrency | No speculation | Standalone K=4 | Suffix static K=4 | Final dynamic K | Fixed speculation vs no-spec | Suffix fusion vs standalone | Dynamic K vs suffix static | Total dynamic vs no-spec |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 258.02 | 368.35 | 358.80 | 382.21 | +42.76% | -2.59% | +6.52% | **+48.13%** |
+| 20 | 294.40 | 390.89 | 376.26 | 426.98 | +32.78% | -3.74% | +13.48% | **+45.03%** |
+| 24 | 309.05 | 386.35 | 372.12 | 395.73 | +25.01% | -3.68% | +6.34% | **+28.05%** |
+| 30 | 340.41 | 397.55 | 379.74 | 412.95 | +16.79% | -4.48% | +8.75% | **+21.31%** |
+
+All submitted requests completed in every one of the four repeats. The
+interpretation is important: fixed K=4 standalone speculation is the largest
+source of end-to-end gain. With the same K=4 width, ArcticInference suffix
+fusion still requires one target verify round but adds suffix-cache lookup,
+proposal selection, and override work, so it is a -2.59% to -4.48% net cost
+on this workload. Dynamic K is what converts suffix reuse into a net benefit:
+it recovers that cost and beats standalone K=4 by +3.76%, +9.23%, +2.43%, and
++3.87% at concurrency 10/20/24/30 respectively. Thus present the suffix
+component as a prerequisite for dynamic widening, not as a standalone
+throughput optimization at fixed K=4.
 
 ### Scope and method
 

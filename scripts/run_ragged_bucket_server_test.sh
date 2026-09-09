@@ -13,6 +13,10 @@ git merge --ff-only FETCH_HEAD
 
 export PYTHONPATH="${SGLANG_DIR}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
+source "${SGLANG_DIR}/scripts/configure_cpp_runtime.sh"
+configure_cpp_runtime
+check_zmq_runtime
+
 export GPU_IDS="${GPU_IDS:-0,1,2,3}"
 export TP_SIZE="${TP_SIZE:-4}"
 export MODEL_PATH="${MODEL_PATH:-/models/models/Qwen/Qwen2.5-72B-Instruct-AWQ}"

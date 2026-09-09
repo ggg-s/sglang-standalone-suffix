@@ -50,7 +50,9 @@ DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN="${DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN:-7}"
 DYNAMIC_EXPERIMENT_NAME="${DYNAMIC_EXPERIMENT_NAME:-dynamic_k4_k8}"
 SUFFIX_BACKEND="${SUFFIX_BACKEND:-arctic}"
 SUFFIX_DATASET_CACHE_MAX_REQUESTS="${SUFFIX_DATASET_CACHE_MAX_REQUESTS:-0}"
-PRELOAD_LIBSTDCXX="${PRELOAD_LIBSTDCXX:-/usr/lib/x86_64-linux-gnu/libstdc++.so.6}"
+source "${SGLANG_DIR}/scripts/configure_cpp_runtime.sh"
+configure_cpp_runtime
+check_zmq_runtime
 
 # The measured workload is kept identical to the command supplied by the user.
 MEASURE_PROMPTS=( ${MEASURE_PROMPTS:-40 80 96} )
@@ -168,9 +170,6 @@ start_server() {
     )
     if [[ -n "${GPU_IDS}" ]]; then
         args=(env "CUDA_VISIBLE_DEVICES=${GPU_IDS}" "${args[@]}")
-    fi
-    if [[ -n "${PRELOAD_LIBSTDCXX}" ]]; then
-        args=(env "LD_PRELOAD=${PRELOAD_LIBSTDCXX}" "${args[@]}")
     fi
     if [[ "${RAGGED_CUDA_GRAPH}" == "1" && "${experiment}" == "${DYNAMIC_EXPERIMENT_NAME}" ]]; then
         args+=(

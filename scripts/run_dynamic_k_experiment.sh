@@ -31,8 +31,9 @@ DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/models/Qwen/Qwen3-0.6B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 
 HOST="${HOST:-0.0.0.0}"
-CLIENT_BASE_URL="${CLIENT_BASE_URL:-http://127.0.0.1:30000}"
 PORT="${PORT:-30000}"
+source "${SGLANG_DIR}/scripts/benchmark_http.sh"
+configure_benchmark_http
 TP_SIZE="${TP_SIZE:-4}"
 GPU_IDS="${GPU_IDS:-}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.72}"
@@ -98,25 +99,10 @@ should_run_experiment() {
     return 1
 }
 
-wait_for_server() {
-    local deadline=$((SECONDS + SERVER_START_TIMEOUT))
-    while (( SECONDS < deadline )); do
-        if curl --fail --silent --show-error "${CLIENT_BASE_URL}/health" >/dev/null 2>&1; then
-            return 0
-        fi
-        if [[ -n "${SERVER_PID}" ]] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-            echo "Server exited before becoming healthy. See ${CURRENT_DIR}/server.log" >&2
-            return 1
-        fi
-        sleep 2
-    done
-    echo "Timed out waiting for ${CLIENT_BASE_URL}/health. See ${CURRENT_DIR}/server.log" >&2
-    return 1
-}
-
 snapshot_metrics() {
     local name="$1"
-    curl --fail --silent --show-error "${CLIENT_BASE_URL}/metrics" > "${CURRENT_DIR}/metrics_${name}.prom"
+    curl --noproxy "${NO_PROXY}" --connect-timeout 3 --max-time 30 \
+        --fail --silent --show-error "${CLIENT_BASE_URL}/metrics" > "${CURRENT_DIR}/metrics_${name}.prom"
     grep -E '^sglang:(suffix_|dynamic_k|ragged_|spec_accept_)' "${CURRENT_DIR}/metrics_${name}.prom" \
         > "${CURRENT_DIR}/metrics_${name}_focus.prom" || true
 }

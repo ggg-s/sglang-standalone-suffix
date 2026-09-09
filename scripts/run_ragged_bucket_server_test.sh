@@ -32,7 +32,8 @@ export ATTENTION_BACKEND="${ATTENTION_BACKEND:-fa3}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.72}"
 export PORT="${PORT:-30000}"
-export CLIENT_BASE_URL="${CLIENT_BASE_URL:-http://127.0.0.1:${PORT}}"
+source "${SGLANG_DIR}/scripts/benchmark_http.sh"
+configure_benchmark_http
 
 export CONCURRENCIES="${CONCURRENCIES:-20 24 30}"
 export REPEATS="${REPEATS:-3}"

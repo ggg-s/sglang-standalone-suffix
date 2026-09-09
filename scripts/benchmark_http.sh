@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # Shared HTTP setup/readiness checks for locally launched benchmark servers.
 
+require_benchmark_curl() {
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "Missing required command: curl. Install it before starting the benchmark." >&2
+        echo "In the active Conda environment: conda install curl" >&2
+        echo "Then verify: curl --version" >&2
+        return 127
+    fi
+}
+
 configure_benchmark_http() {
+    require_benchmark_curl || return $?
     export PORT="${PORT:-30000}"
     export CLIENT_BASE_URL="${CLIENT_BASE_URL:-http://127.0.0.1:${PORT}}"
     CLIENT_BASE_URL="${CLIENT_BASE_URL%/}"
@@ -11,6 +21,7 @@ configure_benchmark_http() {
 }
 
 wait_for_server() {
+    require_benchmark_curl || return $?
     local deadline=$((SECONDS + SERVER_START_TIMEOUT))
     local next_report=0 previous="" status="" code rc remaining probe_timeout
     local error_file="${CURRENT_DIR}/health_check.error"
@@ -29,6 +40,11 @@ wait_for_server() {
             --connect-timeout 3 --max-time "${probe_timeout}" \
             --output /dev/null --write-out '%{http_code}' \
             "${CLIENT_BASE_URL}/health" 2>"${error_file}") || rc=$?
+        if [[ "${rc}" == 126 || "${rc}" == 127 ]]; then
+            echo "Cannot execute curl (exit ${rc}); aborting health checks." >&2
+            cat "${error_file}" >&2
+            return "${rc}"
+        fi
         if [[ "${rc}" == 0 && "${code}" == 200 ]]; then
             echo "Server ready: ${CLIENT_BASE_URL}/health returned HTTP 200"
             return 0

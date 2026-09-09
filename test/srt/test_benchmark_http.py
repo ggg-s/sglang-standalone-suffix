@@ -1,6 +1,7 @@
 """Exercise readiness decisions with deterministic curl responses, without GPUs."""
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -27,7 +28,6 @@ class BenchmarkHttpTests(unittest.TestCase):
             script = """
 set -euo pipefail
 source "$1/scripts/benchmark_http.sh"
-configure_benchmark_http
 CURRENT_DIR="$2"
 HOST=0.0.0.0
 SERVER_PID=$$
@@ -40,6 +40,7 @@ curl() {
     return "$MOCK_EXIT"
 }
 sleep() { SECONDS=$((SECONDS + 2)); }
+configure_benchmark_http
 wait_for_server
 """
             result = subprocess.run(
@@ -79,6 +80,35 @@ wait_for_server
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("curl exit 7", result.stderr)
         self.assertIn("mock connection failure", result.stderr)
+
+    def test_missing_curl_stops_before_model_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ.copy()
+            env["PATH"] = directory
+            result = subprocess.run(
+                [
+                    shutil.which("bash"),
+                    "-c",
+                    'set -euo pipefail; source "$1/scripts/benchmark_http.sh"; '
+                    'configure_benchmark_http; printf "MODEL_START\\n"',
+                    "test",
+                    str(ROOT),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 127)
+            self.assertIn("Missing required command: curl", result.stderr)
+            self.assertNotIn("MODEL_START", result.stdout)
+
+    def test_curl_execution_failure_does_not_wait_for_timeout(self):
+        for code in ("126", "127"):
+            result, _ = self.run_probe(code="000", exit_code=code)
+            self.assertEqual(result.returncode, int(code))
+            self.assertIn("Cannot execute curl", result.stderr)
+            self.assertNotIn("Timed out waiting", result.stderr)
 
 
 if __name__ == "__main__":

@@ -392,8 +392,12 @@ class ServerArgs:
     speculative_dynamic_k_enable: bool = False
     speculative_normal_draft_token_num: int = 4
     speculative_long_suffix_draft_token_num: int = 8
-    speculative_long_suffix_min_match_len: int = 7
+    speculative_long_suffix_min_match_len: int = 23
     speculative_high_bs_threshold: int = 10
+    speculative_ragged_cuda_graph: bool = False
+    speculative_ragged_cuda_graph_max_bs: int = 32
+    speculative_ragged_cuda_graph_token_multiple: int = 16
+    speculative_ragged_cuda_graph_max_padding_ratio: float = 0.125
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -1540,6 +1544,15 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_ragged_cuda_graph and self.speculative_algorithm not in (
+            "EAGLE",
+            "EAGLE3",
+            "STANDALONE",
+        ):
+            raise ValueError(
+                "Bucketed ragged graphs require an EAGLE or STANDALONE worker."
+            )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -1621,6 +1634,10 @@ class ServerArgs:
                 )
 
             if self.speculative_dynamic_k_enable:
+                if self.speculative_long_suffix_min_match_len <= 0:
+                    raise ValueError(
+                        "The common suffix match-length floor must be positive."
+                    )
                 if not self.speculative_suffix_enable:
                     raise ValueError(
                         "--speculative-dynamic-k-enable requires --speculative-suffix-enable."
@@ -1644,12 +1661,37 @@ class ServerArgs:
                         "Dynamic-K standalone+suffix decoding does not support DP attention."
                     )
                 self.disable_overlap_schedule = True
-                self.speculative_num_steps = (
-                    self.speculative_normal_draft_token_num - 1
-                )
+                self.speculative_num_steps = self.speculative_normal_draft_token_num - 1
                 self.speculative_num_draft_tokens = (
                     self.speculative_normal_draft_token_num
                 )
+
+            if self.speculative_ragged_cuda_graph:
+                from sglang.srt.speculative.ragged_cuda_graph import RaggedGraphConfig
+
+                RaggedGraphConfig.from_server_args(self)
+                if not (
+                    self.speculative_dynamic_k_enable
+                    and self.speculative_suffix_enable
+                    and self.attention_backend == "fa3"
+                    and self.page_size == 1
+                    and self.speculative_eagle_topk == 1
+                ):
+                    raise ValueError(
+                        "Bucketed ragged CUDA graphs require dynamic-K suffix, "
+                        "FA3, page-size=1, and topk=1."
+                    )
+                if any(
+                    os.environ.get(name, "").strip()
+                    for name in (
+                        "SGLANG_DYNAMIC_K_TIERS",
+                        "SGLANG_DYNAMIC_K_BATCH_POLICY",
+                    )
+                ):
+                    raise ValueError(
+                        "Bucketed graphs currently support the binary normal/long "
+                        "policy and optional high-batch fallback, not custom tiers."
+                    )
 
             if (
                 self.speculative_eagle_topk == 1
@@ -2944,7 +2986,7 @@ class ServerArgs:
             "--speculative-long-suffix-min-match-len",
             type=int,
             default=ServerArgs.speculative_long_suffix_min_match_len,
-            help="Minimum suffix proposal match length required to use the long suffix verify width.",
+            help="Common minimum suffix match length for all dynamic-K tiers, including high-batch fallback.",
         )
         parser.add_argument(
             "--speculative-high-bs-threshold",
@@ -2953,6 +2995,30 @@ class ServerArgs:
             help="Running batch size threshold at which dynamic-K falls back to the normal verify width.",
         )
         # Ngram speculative decoding
+        parser.add_argument(
+            "--speculative-ragged-cuda-graph",
+            action="store_true",
+            default=ServerArgs.speculative_ragged_cuda_graph,
+            help="Capture finite FA3 ragged verify buckets at startup (opt-in).",
+        )
+        parser.add_argument(
+            "--speculative-ragged-cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.speculative_ragged_cuda_graph_max_bs,
+            help="Largest exact active batch size covered by ragged graph buckets.",
+        )
+        parser.add_argument(
+            "--speculative-ragged-cuda-graph-token-multiple",
+            type=int,
+            default=ServerArgs.speculative_ragged_cuda_graph_token_multiple,
+            help="Round total query tokens to this multiple for mixed batches.",
+        )
+        parser.add_argument(
+            "--speculative-ragged-cuda-graph-max-padding-ratio",
+            type=float,
+            default=ServerArgs.speculative_ragged_cuda_graph_max_padding_ratio,
+            help="Maximum synthetic/real token ratio; larger padding falls back to eager.",
+        )
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",
             type=int,

@@ -326,6 +326,9 @@ class SchedulerOutputProcessorMixin:
                     result.ragged_verify_cuda_graph_batch_count,
                     result.ragged_verify_varlen_cuda_graph_batch_count,
                     result.ragged_verify_eager_batch_count,
+                    result.ragged_verify_bucket_cuda_graph_batch_count,
+                    result.ragged_verify_bucket_real_token_count,
+                    result.ragged_verify_bucket_padding_token_count,
                 )
 
         self.token_to_kv_pool_allocator.free_group_begin()

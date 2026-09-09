@@ -1,115 +1,142 @@
 # Standalone + Suffix Dynamic-K Speculative Decoding
 
-## Background
+## Current policy: common match floor and finite graph buckets
 
-This repository adds a hybrid speculative decoding path for SGLang that combines:
+The current final-policy launch scripts use Standalone drafting with suffix
+assistance, greedy FA3 verification, and a common `match_len >= 23` floor.
+K includes the root token: K=4 verifies three draft candidates, K=16 fifteen.
 
-- **Standalone drafting**: uses the standalone draft model as the default drafter.
-- **Suffix drafting**: uses ArcticInference-style suffix cache hits to replace standalone draft tokens when the suffix proposal is stronger.
-- **Dynamic-K verification**: uses different target verification widths per request group, while keeping the draft layout chain-based rather than tree-based.
+| Active decode batch | Candidate width | Required suffix evidence | Otherwise |
+| --- | --- | --- | --- |
+| Below 24 | K=16 | match >=23, score >=15, at least 15 candidates | K=4 |
+| At least 24 | K=8 | match >=23, score >=7, at least 7 candidates | K=4 |
 
-The goal is to keep standalone+suffix useful under realistic online concurrency. Low concurrency can still benefit from long suffix hits, while higher concurrency avoids spending too much target verification time on long verify windows.
+The floor is `--speculative-long-suffix-min-match-len` (default 23) and applies
+to **every dynamic widening tier**, including high-batch fallback. Legacy
+`K:min_match` tiers may impose a stricter threshold but cannot relax this
+common floor. Normal K=4 suffix overrides retain their existing eligibility.
+The standalone draft model still runs before suffix selection.
 
-## Core Strategy
+## Verification and graph execution
 
-`K` is the target verification width and includes the root/current token.
+Each batch has real candidate lengths (`valid_widths`) and, if bucket padding
+is selected, physical model-input lengths (`exec_widths`). Both remain causal
+chains. FA3 consumes one flattened query and its per-request `cu_seqlens_q`;
+it performs one target forward for the whole batch.
 
-- `K=4` means `[root + 3 draft tokens]`.
-- `K=8` means `[root + 7 draft tokens]`.
+The opt-in `--speculative-ragged-cuda-graph` enables the following finite plan:
 
-The runtime policy is:
+1. Homogeneous batches replay available fixed K=4/8/16 graphs. The high-batch
+   fallback width is included in fixed graph capture and FA3 metadata allocation.
+2. Mixed batches, up to active batch 32, round total query tokens up to
+   a multiple of 16, capped at `batch_size * max_K`.
+3. If synthetic/real token count exceeds 0.125, use eager ragged instead.
+4. A bucket that reaches full width reuses the fixed-K graph rather than
+   capturing a duplicate. Other buckets use `(B, total_execution_tokens, max_K)`.
+5. Context capacity, extra KV-slot availability, and graph eligibility are
+   checked before padding. Unavailable buckets or unsupported cases use eager.
 
-- **Normal group, K=4**
-  - standalone requests
-  - suffix-short requests
-  - high-concurrency requests
-- **Long suffix group, K=8**
-  - low-concurrency requests
-  - suffix proposal has enough match depth
-  - suffix proposal can provide enough tokens for the long verify window
+The target workload is 20--30 concurrent online requests. Smaller active batches
+use the same bucketing rule because batches shrink as requests finish; there is
+no separate exact-capture policy for batches of eight or fewer requests.
 
-For one request in one decode round, only one drafter path is used:
+Example: three K=16 and seven K=4 requests need 76 real tokens. A bucket of 80
+executes four synthetic tail tokens on a short row (or another row with enough
+context capacity). Valid K values are unchanged. FA3/KV allocation uses physical
+lengths; acceptance uses real candidate indices. Rejected and synthetic KV slots
+are freed together. The original compact draft-token offsets and the physical
+model/logit offsets are kept separately.
 
-- If it enters the long suffix group, suffix overrides standalone.
-- Otherwise it uses the normal K=4 path, where suffix-short may still override standalone within the fixed K=4 width.
+All graphs are captured at startup using synthetic inputs: no traffic prediction
+or online capture is required. With normal=4, long=16, fallback=8, threshold=24,
+and max active batch=32, the planner enumerates **233 distinct mixed bucket
+shapes**, versus 496 exact mixed shapes. Pure-width buckets reuse fixed graphs.
+These counts describe shapes, not memory consumption or a measured replay rate.
 
-This keeps the implementation chain-based and avoids tree verification complexity.
+Bucket mode currently targets the causal FA3 decoder path with page_size=1,
+topk=1, greedy sampling, and no grammar/logprob requests. Sliding-window/local
+attention, MLA/hybrid backends, LoRA, pipeline parallelism, gathered buffers and two-batch overlap are not
+bucket-enabled. Custom multi-tier/batch-policy environment settings are rejected
+in bucket mode; the binary policy plus its high-batch fallback is supported.
 
-## Runtime Flow
-
-1. Run the standalone draft model to produce the default draft tokens.
-2. Query the suffix proposer for each request.
-3. Classify requests:
-   - if `batch_size >= speculative_high_bs_threshold`, all requests use K=4.
-   - otherwise, requests with suffix `match_len >= speculative_long_suffix_min_match_len` and enough suffix tokens enter the K=8 group.
-   - all remaining requests enter the K=4 group.
-4. Build verify inputs:
-   - a homogeneous batch uses the fixed K=4 or K=8 input.
-   - a supported mixed FA3 batch uses one flattened ragged input: K=4
-     rows use the standalone/suffix-short chain and K=8 rows use the linear
-     suffix chain.
-5. Target verify:
-   - fixed-width inputs retain their normal CUDA-graph path.
-   - a ragged mixed input issues **one** FA3 target forward; it does not split
-     the batch or merge two verify results.
-   - when at least 75% of rows are K=8, the mixed input is padded per row to
-     K=8 and replays the existing fixed-K=8 CUDA Graph. The synthetic K=4
-     tails are never accepted and their KV slots are released immediately.
-6. Greedy acceptance maps the flattened accepted indices back to each request,
-   then advances `seq_lens`, KV ownership, `verified_id`, and the next-round
-   `EagleDraftInput`.
-
-## CUDA Graph Handling
-
-Fixed-width target verify CUDA graphs are keyed by `(K, bs_bucket)`.
-
-For dynamic-K standalone+suffix, the graph runner captures and replays at least:
-
-- K=4 graphs for normal requests.
-- K=8 graphs for homogeneous low-batch long suffix requests.
-
-The graph shape is fixed per `(K, bs_bucket)`, but token values remain dynamic.
-This means suffix token contents can change every round while still reusing the
-same CUDA graph, as long as the verify width and padded batch bucket match.
-
-Mixed ragged batches use eager FA3 by default. A bounded graph path reuses the
-existing K=8 graph when the K=8 row ratio is at least 75%; it pads only the
-unobserved causal suffix of K=4 rows and frees those cache slots after verify.
-Set `SGLANG_RAGGED_CUDA_GRAPH_MIN_LONG_RATIO` to tune this
-coverage/per-row-padding trade-off. The production-safe default is now `1.0`
-(pure eager Ragged); lower values are experimental padding-graph policies.
-The graph/eager coverage counters below are the rollout gate.
+Bucket mode replaces `SGLANG_RAGGED_VARLEN_CUDA_GRAPH_PATTERNS` and does not use
+the legacy whole-batch padding ratio for mixed inputs. When bucket mode is off,
+legacy explicitly selected compact graphs and their eager/padding fallbacks
+remain available.
 
 ## Configuration
 
-New flags:
+Add these settings to a Standalone+suffix server:
 
 ```bash
---speculative-dynamic-k-enable
---speculative-normal-draft-token-num 4
---speculative-long-suffix-draft-token-num 8
---speculative-long-suffix-min-match-len 7
---speculative-high-bs-threshold 20
+SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK=8:23 python -m sglang.launch_server \
+  --model-path /path/to/target --speculative-draft-model-path /path/to/draft \
+  --attention-backend fa3 --page-size 1 --max-running-requests 32 \
+  --speculative-algorithm STANDALONE --speculative-eagle-topk 1 \
+  --speculative-suffix-enable --speculative-dynamic-k-enable \
+  --speculative-normal-draft-token-num 4 \
+  --speculative-long-suffix-draft-token-num 16 \
+  --speculative-long-suffix-min-match-len 23 \
+  --speculative-high-bs-threshold 24 \
+  --speculative-ragged-cuda-graph
 ```
 
-Recommended starting point:
+| Bucket argument | Default |
+| --- | ---: |
+| `--speculative-ragged-cuda-graph-max-bs` | 32 |
+| `--speculative-ragged-cuda-graph-token-multiple` | 16 |
+| `--speculative-ragged-cuda-graph-max-padding-ratio` | 0.125 |
+
+The effective maximum is also bounded by the running-request limit and available
+CUDA graph batch-size range. The runner adds all exact B values within that
+range. Startup capture and graph memory increase; reduce max-bs to bound cost.
+
+`run_final_dynamic_k_policy_ab.sh` and `run_full_stack_final_policy_validation.sh`
+now enable buckets for the dynamic candidate by default. Set
+`RAGGED_CUDA_GRAPH=0` to measure the same new match>=23 policy with eager mixed
+verification. This does not revert the common match floor to the old policy.
+
+## Validation and measurement
+
+CPU tests cover the common quality floor, the high-batch width, exhaustive
+shape selection, permutations, padding limits, context capacity, candidate/logit
+mapping, causal-prefix equivalence and the KV eviction index set:
 
 ```bash
---speculative-algorithm STANDALONE \
---speculative-suffix-enable \
---speculative-dynamic-k-enable \
---speculative-normal-draft-token-num 4 \
---speculative-long-suffix-draft-token-num 8 \
---speculative-long-suffix-min-match-len 7 \
---speculative-high-bs-threshold 20
+python test/srt/test_ragged_cuda_graph.py -v
+python test/srt/test_ragged_bucket_summary.py -v
 ```
 
-Interpretation:
+With CUDA and sgl-kernel installed, the first test also captures and replays a
+real FA3 graph across changed request boundaries, comparing against both padded
+and compact eager attention. A CPU run skips this GPU test.
 
-- standalone drafts 3 tokens by default (`K=4`).
-- long suffix hits can verify 7 suffix tokens (`K=8`).
-- with the current benchmark setting `--speculative-high-bs-threshold 20`, an
-  active decode batch below 20 can use K=8; batches at or above 20 use K=4.
+For isolated throughput validation, use fresh servers for **each concurrency**
+and alternate the same policy with and without bucket capture:
+
+```bash
+GPU_IDS=0,1,2,3 TP_SIZE=4 REPEATS=3 \
+  bash scripts/run_ragged_bucket_ab.sh
+```
+
+The summary checks request completion, reports median throughput/TTFT/TPOT,
+and uses measurement-only TP0 metric deltas (excluding warmup). New counters:
+
+- `sglang:ragged_verify_bucket_cuda_graph_batch_total`: successful bucket
+  replays, including eligible full-width buckets that reuse a fixed graph.
+- `sglang:ragged_verify_bucket_real_token_total`: real input tokens, roots included.
+- `sglang:ragged_verify_bucket_padding_token_total`: synthetic input tokens.
+
+`padding_token_total / real_token_total` measures the added query-token work.
+The legacy `ragged_verify_varlen_cuda_graph_batch_total` continues to count only
+legacy explicit compact-pattern replays, not the new bucket path.
+
+**No GPU throughput or end-to-end model accuracy result for this new bucket
+policy has been recorded yet.** The historical results below used older
+policies, including match>=8 for high-batch K=8, and must not be attributed to
+this implementation. Performance estimates are not benchmark results.
+
+## Historical experiments
 
 ## Benchmark Record (2026-07-15)
 

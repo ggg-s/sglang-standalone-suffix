@@ -42,6 +42,10 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-fa3}"
 # Override it for a latency-oriented deployment or further threshold sweeps.
 HIGH_BS_THRESHOLD="${HIGH_BS_THRESHOLD:-24}"
 DYNAMIC_LONG_DRAFT_TOKENS="${DYNAMIC_LONG_DRAFT_TOKENS:-8}"
+RAGGED_CUDA_GRAPH="${RAGGED_CUDA_GRAPH:-0}"
+RAGGED_GRAPH_MAX_BS="${RAGGED_GRAPH_MAX_BS:-32}"
+RAGGED_GRAPH_TOKEN_MULTIPLE="${RAGGED_GRAPH_TOKEN_MULTIPLE:-16}"
+RAGGED_GRAPH_MAX_PADDING_RATIO="${RAGGED_GRAPH_MAX_PADDING_RATIO:-0.125}"
 DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN="${DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN:-7}"
 DYNAMIC_EXPERIMENT_NAME="${DYNAMIC_EXPERIMENT_NAME:-dynamic_k4_k8}"
 SUFFIX_BACKEND="${SUFFIX_BACKEND:-arctic}"
@@ -168,6 +172,14 @@ start_server() {
     if [[ -n "${PRELOAD_LIBSTDCXX}" ]]; then
         args=(env "LD_PRELOAD=${PRELOAD_LIBSTDCXX}" "${args[@]}")
     fi
+    if [[ "${RAGGED_CUDA_GRAPH}" == "1" && "${experiment}" == "${DYNAMIC_EXPERIMENT_NAME}" ]]; then
+        args+=(
+            --speculative-ragged-cuda-graph
+            --speculative-ragged-cuda-graph-max-bs "${RAGGED_GRAPH_MAX_BS}"
+            --speculative-ragged-cuda-graph-token-multiple "${RAGGED_GRAPH_TOKEN_MULTIPLE}"
+            --speculative-ragged-cuda-graph-max-padding-ratio "${RAGGED_GRAPH_MAX_PADDING_RATIO}"
+        )
+    fi
     args+=("$@")
 
     printf '%q ' "${args[@]}" > "${CURRENT_DIR}/server_command.sh"
@@ -232,6 +244,9 @@ per-concurrency measurement logs, Prometheus snapshots, and isolated CSV
 artifacts under *_artifacts/.
 
 Dynamic-K policy: HIGH_BS_THRESHOLD=${HIGH_BS_THRESHOLD}
+Common match floor: ${DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN}
+High-batch fallback: ${SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK:-disabled}
+Bucket graphs: ${RAGGED_CUDA_GRAPH}; max B=${RAGGED_GRAPH_MAX_BS}; token multiple=${RAGGED_GRAPH_TOKEN_MULTIPLE}; max padding=${RAGGED_GRAPH_MAX_PADDING_RATIO}
 Suffix backend: ${SUFFIX_BACKEND}
 Suffix dataset-tree capacity: ${SUFFIX_DATASET_CACHE_MAX_REQUESTS}
 

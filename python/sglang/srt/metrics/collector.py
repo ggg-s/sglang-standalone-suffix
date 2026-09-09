@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -346,6 +347,21 @@ class SchedulerMetricsCollector:
             ),
             labelnames=labels.keys(),
         )
+        self.ragged_verify_bucket_cuda_graph_batch_total = Counter(
+            name="sglang:ragged_verify_bucket_cuda_graph_batch_total",
+            documentation="Ragged target verify batches replayed by a finite bucket CUDA Graph.",
+            labelnames=labels.keys(),
+        )
+        self.ragged_verify_bucket_real_token_total = Counter(
+            name="sglang:ragged_verify_bucket_real_token_total",
+            documentation="Real input tokens in bucket CUDA Graph replays, including roots.",
+            labelnames=labels.keys(),
+        )
+        self.ragged_verify_bucket_padding_token_total = Counter(
+            name="sglang:ragged_verify_bucket_padding_token_total",
+            documentation="Synthetic causal tail tokens executed by bucket CUDA Graph replays.",
+            labelnames=labels.keys(),
+        )
         self.ragged_verify_eager_batch_total = Counter(
             name="sglang:ragged_verify_eager_batch_total",
             documentation="Ragged dynamic-K target verify batches executed eagerly.",
@@ -671,9 +687,24 @@ class SchedulerMetricsCollector:
         ragged_verify_cuda_graph_batch_count: int,
         ragged_verify_varlen_cuda_graph_batch_count: int,
         ragged_verify_eager_batch_count: int,
+        ragged_verify_bucket_cuda_graph_batch_count: int = 0,
+        ragged_verify_bucket_real_token_count: int = 0,
+        ragged_verify_bucket_padding_token_count: int = 0,
     ) -> None:
         """Publish cumulative suffix/dynamic-K counters for one scheduler batch."""
         metric_values = (
+            (
+                self.ragged_verify_bucket_cuda_graph_batch_total,
+                ragged_verify_bucket_cuda_graph_batch_count,
+            ),
+            (
+                self.ragged_verify_bucket_real_token_total,
+                ragged_verify_bucket_real_token_count,
+            ),
+            (
+                self.ragged_verify_bucket_padding_token_total,
+                ragged_verify_bucket_padding_token_count,
+            ),
             (self.suffix_proposal_total, proposal_count),
             (self.suffix_override_total, override_count),
             (self.dynamic_k8_request_total, long_request_count),

@@ -63,7 +63,7 @@ run_case() {
         DYNAMIC_LONG_DRAFT_TOKENS=16 \
         DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN=23 \
         HIGH_BS_THRESHOLD=24 \
-        SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK=8:8 \
+        SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK=8:23 \
         bash "${SGLANG_DIR}/scripts/run_dynamic_k_experiment.sh"
 }
 

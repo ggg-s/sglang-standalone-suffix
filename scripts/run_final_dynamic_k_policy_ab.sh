@@ -3,7 +3,7 @@
 #
 # Baseline: suffix static K=4.
 # Candidate: K=16 when active batch < 24 and suffix match >= 23; at active
-# batch >= 24, suffix K=8 when match >= 8; all other rows remain K=4.
+# batch >= 24, suffix K=8 when match >= 23; all other rows remain K=4.
 #
 # Each round launches a fresh server. Odd rounds execute baseline then
 # candidate, even rounds candidate then baseline. The companion summarizer
@@ -78,7 +78,8 @@ run_case() {
         DYNAMIC_LONG_DRAFT_TOKENS=16 \
         DYNAMIC_LONG_SUFFIX_MIN_MATCH_LEN=23 \
         HIGH_BS_THRESHOLD=24 \
-        SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK=8:8 \
+        SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK=8:23 \
+        RAGGED_CUDA_GRAPH="${RAGGED_CUDA_GRAPH:-1}" \
         bash "${SGLANG_DIR}/scripts/run_dynamic_k_experiment.sh"
 }
 

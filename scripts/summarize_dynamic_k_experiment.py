@@ -7,7 +7,6 @@ import argparse
 import re
 from pathlib import Path
 
-
 METRICS = (
     "sglang:suffix_proposal_total",
     "sglang:suffix_override_total",
@@ -19,6 +18,9 @@ METRICS = (
     "sglang:dynamic_k_normal_verify_call_total",
     "sglang:dynamic_k_long_verify_call_total",
     "sglang:ragged_verify_varlen_cuda_graph_batch_total",
+    "sglang:ragged_verify_bucket_cuda_graph_batch_total",
+    "sglang:ragged_verify_bucket_real_token_total",
+    "sglang:ragged_verify_bucket_padding_token_total",
 )
 SNAPSHOTS = ("startup", "after_warmup", "after_k8_probe", "after_measurement")
 LABEL_RE = re.compile(r'tp_rank="([^"]+)"')
@@ -103,7 +105,12 @@ def write_throughput_comparison(results_dir: Path) -> None:
             parsed = parse_measurement_log(log_path)
             if parsed is not None:
                 rows.append({"config": config, **parsed})
-    rows.sort(key=lambda row: (int(row["concurrency"]), CONFIG_ORDER.index(str(row["config"]))))
+    rows.sort(
+        key=lambda row: (
+            int(row["concurrency"]),
+            CONFIG_ORDER.index(str(row["config"])),
+        )
+    )
     if not rows:
         return
 
@@ -140,6 +147,7 @@ def write_throughput_comparison(results_dir: Path) -> None:
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for concurrency, config_rows in sorted(by_concurrency.items()):
+
         def throughput(config: str) -> float | None:
             row = config_rows.get(config)
             return None if row is None else float(row["total_output_tok_s"])
@@ -228,10 +236,12 @@ def main() -> None:
         "experiment\tphase\tproposals\toverrides\tk8_requests"
         "\tk8_output_tokens\tk8_draft_tokens\tk8_efficiency"
         "\tdynamic_batches\tmixed_batches\tk4_verify_calls\tlong_verify_calls"
-        "\tvarlen_graph_batches"
+        "\tvarlen_graph_batches\tbucket_graph_batches\tbucket_real_tokens\tbucket_padding_tokens"
     )
     dynamic_probe: dict[str, float] | None = None
-    for experiment_dir in sorted(path for path in args.results_dir.iterdir() if path.is_dir()):
+    for experiment_dir in sorted(
+        path for path in args.results_dir.iterdir() if path.is_dir()
+    ):
         if not (experiment_dir / "metrics_startup.prom").exists():
             continue
         snapshots = {
@@ -279,6 +289,9 @@ def main() -> None:
                 f"{delta['sglang:dynamic_k_normal_verify_call_total']:.0f}\t"
                 f"{delta['sglang:dynamic_k_long_verify_call_total']:.0f}\t"
                 f"{delta['sglang:ragged_verify_varlen_cuda_graph_batch_total']:.0f}"
+                f"\t{delta['sglang:ragged_verify_bucket_cuda_graph_batch_total']:.0f}"
+                f"\t{delta['sglang:ragged_verify_bucket_real_token_total']:.0f}"
+                f"\t{delta['sglang:ragged_verify_bucket_padding_token_total']:.0f}"
             )
             if experiment_dir.name == "dynamic_k4_k8" and phase == "k8_probe":
                 dynamic_probe = delta

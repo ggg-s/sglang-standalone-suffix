@@ -53,6 +53,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.speculative.ragged_cuda_graph import (
+    RaggedGraphConfig,
+    dynamic_verify_widths,
+    enumerate_bucket_shapes,
+    high_batch_fallback_width,
+)
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
@@ -257,6 +263,55 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.ragged_bucket_config = None
+        self.ragged_bucket_shapes = {}
+        args = model_runner.server_args
+        if args.speculative_ragged_cuda_graph and not args.disable_cuda_graph:
+            backend = model_runner.attn_backend
+            supported = (
+                not model_runner.is_draft_worker
+                and not self.require_gathered_buffer
+                and not self.enable_two_batch_overlap
+                and not self.is_encoder_decoder
+                and not args.enable_lora
+                and self.pp_size == 1
+                and not getattr(model_runner, "is_hybrid", False)
+                and getattr(backend, "fa_impl_ver", None) == 3
+                and not getattr(backend, "use_mla", False)
+                and not getattr(backend, "has_swa", False)
+                and getattr(backend, "attention_chunk_size", None) is None
+            )
+            if supported:
+                self.ragged_bucket_config = RaggedGraphConfig.from_server_args(args)
+                limit = min(
+                    self.ragged_bucket_config.max_bs,
+                    max(self.capture_bs),
+                    args.max_running_requests or self.ragged_bucket_config.max_bs,
+                )
+                # Preserve exact B: only tokens, not requests, are padded.
+                self.capture_bs = sorted(
+                    set(self.capture_bs) | set(range(1, limit + 1))
+                )
+                fallback = high_batch_fallback_width(
+                    os.environ.get("SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK", ""),
+                    args.speculative_normal_draft_token_num,
+                )
+                self.ragged_bucket_shapes = enumerate_bucket_shapes(
+                    args.speculative_normal_draft_token_num,
+                    args.speculative_long_suffix_draft_token_num,
+                    args.speculative_high_bs_threshold,
+                    fallback,
+                    self.ragged_bucket_config,
+                    limit,
+                )
+                log_info_on_rank0(
+                    logger,
+                    f"Capture {len(self.ragged_bucket_shapes)} ragged bucket graphs",
+                )
+            else:
+                logger.warning(
+                    "Ragged bucket graphs unsupported for this model/backend; using eager ragged."
+                )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         self.ragged_varlen_patterns = self._parse_ragged_varlen_patterns()
         if self.ragged_varlen_patterns:
@@ -289,17 +344,13 @@ class CudaGraphRunner:
                         or model_runner.spec_algorithm.is_standalone()
                     )
                 ):
-                    self.capture_num_tokens_per_bs_values = sorted(
-                        set(
-                            [
-                                model_runner.server_args.speculative_normal_draft_token_num,
-                                model_runner.server_args.speculative_long_suffix_draft_token_num,
-                            ]
+                    self.capture_num_tokens_per_bs_values = list(
+                        dynamic_verify_widths(
+                            model_runner.server_args,
+                            os.environ.get("SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK", ""),
                         )
                     )
-                    self.num_tokens_per_bs = max(
-                        self.capture_num_tokens_per_bs_values
-                    )
+                    self.num_tokens_per_bs = max(self.capture_num_tokens_per_bs_values)
                 else:
                     self.num_tokens_per_bs = (
                         self.model_runner.server_args.speculative_num_draft_tokens
@@ -420,15 +471,30 @@ class CudaGraphRunner:
     def _get_num_tokens_per_bs(self, forward_batch: ForwardBatch) -> int:
         spec_info = getattr(forward_batch, "spec_info", None)
         draft_token_num = getattr(spec_info, "draft_token_num", None)
-        if forward_batch.forward_mode.is_target_verify() and draft_token_num is not None:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and draft_token_num is not None
+        ):
             return int(draft_token_num)
         return self.num_tokens_per_bs
 
     def can_run(self, forward_batch: ForwardBatch):
         spec_info = getattr(forward_batch, "spec_info", None)
+        bucket = getattr(spec_info, "ragged_cuda_graph_bucket_key", None)
+        if bucket is not None:
+            return (
+                self.can_run_ragged_bucket_target_verify(bucket)
+                and forward_batch.forward_mode.is_target_verify()
+                and forward_batch.batch_size == bucket[0]
+                and forward_batch.input_ids.numel() == bucket[1]
+                and spec_info.draft_token_num == bucket[2]
+                and self.capture_hidden_mode == CaptureHiddenMode.FULL
+            )
         if getattr(spec_info, "ragged_cuda_graph_varlen", False):
             normal_k = self.model_runner.server_args.speculative_normal_draft_token_num
-            long_k = self.model_runner.server_args.speculative_long_suffix_draft_token_num
+            long_k = (
+                self.model_runner.server_args.speculative_long_suffix_draft_token_num
+            )
             key = (
                 "ragged_varlen",
                 forward_batch.batch_size,
@@ -445,10 +511,9 @@ class CudaGraphRunner:
         # Mixed K=4/K=8 target verification normally has a dynamic total
         # query-token count. The bounded replay path explicitly pads it to
         # the captured K=8 shape; unpadded ragged batches remain eager.
-        if (
-            getattr(spec_info, "ragged_draft_token_nums", None) is not None
-            and not getattr(spec_info, "ragged_cuda_graph_padded", False)
-        ):
+        if getattr(
+            spec_info, "ragged_draft_token_nums", None
+        ) is not None and not getattr(spec_info, "ragged_cuda_graph_padded", False):
             return False
         num_tokens_per_bs = self._get_num_tokens_per_bs(forward_batch)
         if num_tokens_per_bs not in self.capture_num_tokens_per_bs_values:
@@ -468,7 +533,10 @@ class CudaGraphRunner:
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
-        if not self.disable_padding and (num_tokens_per_bs, self.capture_bs[-1]) not in self.graphs:
+        if (
+            not self.disable_padding
+            and (num_tokens_per_bs, self.capture_bs[-1]) not in self.graphs
+        ):
             return False
 
         if self.require_mlp_sync:
@@ -547,6 +615,12 @@ class CudaGraphRunner:
         mixed batches retain the correct eager Ragged FA3 path.
         """
         raw = os.environ.get("SGLANG_RAGGED_VARLEN_CUDA_GRAPH_PATTERNS", "")
+        if self.model_runner.server_args.speculative_ragged_cuda_graph:
+            if raw:
+                logger.info(
+                    "Bucketed capture replaces explicitly configured legacy ragged patterns."
+                )
+            return ()
         if not raw:
             return ()
         args = self.model_runner.server_args
@@ -591,14 +665,35 @@ class CudaGraphRunner:
     ) -> bool:
         return ("ragged_varlen", batch_size, k8_count) in self.graphs
 
+    def can_run_ragged_bucket_target_verify(self, key) -> bool:
+        return (
+            self.ragged_bucket_config is not None
+            and not self.model_runner.server_args.disable_cuda_graph
+            and not self.require_gathered_buffer
+            and not self.enable_two_batch_overlap
+            and ("ragged_bucket", *key) in self.graphs
+        )
+
+    def _make_ragged_bucket_capture_spec_info(self, key, execution_widths):
+        bs, _, max_k = key
+        normal_k = self.model_runner.server_args.speculative_normal_draft_token_num
+        spec_info = self._make_ragged_varlen_capture_spec_info(bs, 1, normal_k, max_k)
+        widths = torch.tensor(execution_widths, dtype=torch.int32, device=self.device)
+        spec_info.ragged_draft_token_nums = widths
+        spec_info.ragged_execution_token_nums = widths
+        spec_info.ragged_cu_seqlens_q = torch.nn.functional.pad(
+            torch.cumsum(widths, dim=0, dtype=torch.int32), (1, 0)
+        )
+        spec_info.ragged_cuda_graph_pattern_key = None
+        spec_info.ragged_cuda_graph_bucket_key = key
+        return spec_info
+
     def _make_ragged_varlen_capture_spec_info(
         self, bs: int, k8_count: int, normal_k: int, long_k: int
     ):
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
-        widths = torch.full(
-            (bs,), normal_k, dtype=torch.int32, device=self.device
-        )
+        widths = torch.full((bs,), normal_k, dtype=torch.int32, device=self.device)
         widths[:k8_count] = long_k
         return EagleVerifyInput(
             draft_token=None,
@@ -618,8 +713,7 @@ class CudaGraphRunner:
             ragged_cu_seqlens_q=torch.nn.functional.pad(
                 torch.cumsum(widths, dim=0, dtype=torch.int32), (1, 0)
             ),
-            ragged_long_suffix_mask=torch.arange(bs, device=self.device)
-            < k8_count,
+            ragged_long_suffix_mask=torch.arange(bs, device=self.device) < k8_count,
             ragged_long_suffix_count=k8_count,
             ragged_cuda_graph_varlen=True,
             ragged_cuda_graph_pattern_key=(bs, k8_count),
@@ -692,8 +786,12 @@ class CudaGraphRunner:
                 for bs, k8_count in reversed(
                     getattr(self, "ragged_varlen_patterns", ())
                 ):
-                    long_k = self.model_runner.server_args.speculative_long_suffix_draft_token_num
-                    normal_k = self.model_runner.server_args.speculative_normal_draft_token_num
+                    long_k = (
+                        self.model_runner.server_args.speculative_long_suffix_draft_token_num
+                    )
+                    normal_k = (
+                        self.model_runner.server_args.speculative_normal_draft_token_num
+                    )
                     num_tokens = normal_k * bs + (long_k - normal_k) * k8_count
                     spec_info = self._make_ragged_varlen_capture_spec_info(
                         bs, k8_count, normal_k, long_k
@@ -724,6 +822,34 @@ class CudaGraphRunner:
                         key = ("ragged_varlen", bs, k8_count)
                         self.graphs[key] = graph
                         self.output_buffers[key] = output_buffers
+                    save_gemlite_cache()
+
+                for key, widths in sorted(
+                    getattr(self, "ragged_bucket_shapes", {}).items(),
+                    key=lambda item: item[0][1],
+                    reverse=True,
+                ):
+                    bs, num_tokens, max_k = key
+                    spec_info = self._make_ragged_bucket_capture_spec_info(key, widths)
+                    log_info_on_rank0(
+                        logger,
+                        f"Capturing ragged bucket B={bs} T={num_tokens} K={max_k}",
+                    )
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=num_tokens,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        graph, outputs = self.capture_one_batch_size(
+                            bs,
+                            forward,
+                            num_tokens_override=num_tokens,
+                            spec_info_override=spec_info,
+                        )
+                        graph_key = ("ragged_bucket", *key)
+                        self.graphs[graph_key] = graph
+                        self.output_buffers[graph_key] = outputs
                     save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
@@ -990,9 +1116,7 @@ class CudaGraphRunner:
         # FlashInfer's prefill wrapper cache needs the active speculative width
         # to select the matching CUDA-graph plan for dynamic-K verify.
         if forward_batch.forward_mode.is_target_verify():
-            forward_batch.spec_info.cuda_graph_num_tokens_per_bs = (
-                num_tokens_per_bs
-            )
+            forward_batch.spec_info.cuda_graph_num_tokens_per_bs = num_tokens_per_bs
 
         # Pad
         if is_ragged_varlen:
@@ -1087,6 +1211,11 @@ class CudaGraphRunner:
             if is_ragged_varlen
             else (num_tokens_per_bs, bs)
         )
+        if getattr(spec_info, "ragged_cuda_graph_bucket_key", None) is not None:
+            self.replay_graph_key = (
+                "ragged_bucket",
+                *spec_info.ragged_cuda_graph_bucket_key,
+            )
 
     def replay(
         self,

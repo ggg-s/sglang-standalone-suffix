@@ -44,6 +44,9 @@ class GenerationBatchResult:
     ragged_verify_cuda_graph_batch_count: int = 0
     ragged_verify_varlen_cuda_graph_batch_count: int = 0
     ragged_verify_eager_batch_count: int = 0
+    ragged_verify_bucket_cuda_graph_batch_count: int = 0
+    ragged_verify_bucket_real_token_count: int = 0
+    ragged_verify_bucket_padding_token_count: int = 0
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None

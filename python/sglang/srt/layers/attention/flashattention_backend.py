@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -13,6 +14,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.ragged_cuda_graph import dynamic_verify_widths
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
@@ -352,10 +354,10 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.server_args.speculative_suffix_enable
         ):
             self.target_verify_widths.update(
-                [
-                    model_runner.server_args.speculative_normal_draft_token_num,
-                    model_runner.server_args.speculative_long_suffix_draft_token_num,
-                ]
+                dynamic_verify_widths(
+                    model_runner.server_args,
+                    os.environ.get("SGLANG_DYNAMIC_K_HIGH_BATCH_FALLBACK", ""),
+                )
             )
         self.speculative_step_id = speculative_step_id
 
@@ -497,11 +499,12 @@ class FlashAttentionBackend(AttentionBackend):
                 # captured maximum width. It reuses the normal fixed-K
                 # metadata and graph instead of requiring a graph for every
                 # possible number of K=8 rows.
-                if getattr(
-                    forward_batch.spec_info, "ragged_cuda_graph_padded", False
-                ):
+                if getattr(forward_batch.spec_info, "ragged_cuda_graph_padded", False):
                     ragged_widths = None
                 if ragged_widths is not None:
+                    ragged_widths = (
+                        forward_batch.spec_info.get_ragged_execution_widths()
+                    )
                     # FA3 natively supports a varlen query through
                     # cu_seqlens_q.  This is used by mixed dynamic K=4/K=8
                     # target verification and intentionally remains eager
@@ -513,8 +516,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # metadata setup does not need a GPU scalar readback.
                     metadata.max_seq_len_q = draft_token_num
                     metadata.max_seq_len_k = (
-                        forward_batch.seq_lens_cpu.max().item()
-                        + metadata.max_seq_len_q
+                        forward_batch.seq_lens_cpu.max().item() + metadata.max_seq_len_q
                     )
                     metadata.cu_seqlens_q = forward_batch.spec_info.ragged_cu_seqlens_q
                 else:
@@ -1670,18 +1672,22 @@ class FlashAttentionBackend(AttentionBackend):
                     draft_token_num
                 ]
                 if getattr(spec_info, "ragged_cuda_graph_varlen", False):
-                    key = spec_info.ragged_cuda_graph_pattern_key
-                    metadata.cache_seqlens_int32 = target_verify_state[
-                        "cache_seqlens"
-                    ][:bs]
+                    key = spec_info.get_ragged_metadata_key()
+                    metadata.cache_seqlens_int32 = target_verify_state["cache_seqlens"][
+                        :bs
+                    ]
                     metadata.cache_seqlens_int32.copy_(
-                        seq_lens + spec_info.ragged_draft_token_nums
+                        seq_lens + spec_info.get_ragged_execution_widths()
                     )
                     metadata.max_seq_len_q = draft_token_num
                     metadata.max_seq_len_k = seq_lens.max().item() + draft_token_num
-                    metadata.cu_seqlens_q = target_verify_state["cu_seqlens_q"][: bs + 1]
+                    metadata.cu_seqlens_q = target_verify_state["cu_seqlens_q"][
+                        : bs + 1
+                    ]
                     metadata.cu_seqlens_q.copy_(spec_info.ragged_cu_seqlens_q)
-                    metadata.cu_seqlens_k = target_verify_state["cu_seqlens_k"][: bs + 1]
+                    metadata.cu_seqlens_k = target_verify_state["cu_seqlens_k"][
+                        : bs + 1
+                    ]
                     metadata.page_table = target_verify_state["page_table"][:bs, :]
                     self.target_verify_ragged_cuda_graph_metadata[key] = metadata
                     self.forward_metadata = metadata
@@ -1767,9 +1773,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = num_tokens // bs
-            draft_extend_state = self.draft_extend_cuda_graph_state[
-                num_tokens_per_bs
-            ]
+            draft_extend_state = self.draft_extend_cuda_graph_state[num_tokens_per_bs]
             metadata.cache_seqlens_int32 = draft_extend_state["cache_seqlens"][:bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
@@ -1908,10 +1912,10 @@ class FlashAttentionBackend(AttentionBackend):
             if self.topk <= 1:
                 draft_token_num = self._get_target_verify_draft_token_num(spec_info)
                 if getattr(spec_info, "ragged_cuda_graph_varlen", False):
-                    key = spec_info.ragged_cuda_graph_pattern_key
+                    key = spec_info.get_ragged_metadata_key()
                     metadata = self.target_verify_ragged_cuda_graph_metadata[key]
                     metadata.cache_seqlens_int32.copy_(
-                        seq_lens + spec_info.ragged_draft_token_nums
+                        seq_lens + spec_info.get_ragged_execution_widths()
                     )
                     metadata.cu_seqlens_q.copy_(spec_info.ragged_cu_seqlens_q)
                     metadata.max_seq_len_k = seq_lens_cpu.max().item() + draft_token_num
@@ -1925,7 +1929,9 @@ class FlashAttentionBackend(AttentionBackend):
                     ) // self.page_size
                     page_indices = self.req_to_token[
                         req_pool_indices[:, None],
-                        self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                        self.decode_cuda_graph_metadata["strided_indices"][
+                            :max_seq_pages
+                        ],
                     ]
                     page_indices //= self.page_size
                     metadata.page_table[:, :max_seq_pages].copy_(page_indices)
@@ -2032,9 +2038,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
         elif forward_mode.is_draft_extend():
-            num_tokens_per_bs = getattr(
-                spec_info, "cuda_graph_num_tokens_per_bs", None
-            )
+            num_tokens_per_bs = getattr(spec_info, "cuda_graph_num_tokens_per_bs", None)
             if num_tokens_per_bs is None:
                 raise RuntimeError(
                     "CUDA graph draft-extend replay requires num_tokens_per_bs"

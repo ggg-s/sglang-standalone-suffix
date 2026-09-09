@@ -1,5 +1,5 @@
-import dataclasses
 import copy
+import dataclasses
 import logging
 import os
 import time
@@ -43,11 +43,12 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.suffix_proposer import (
-    SuffixDecodingProposer,
-    SuffixProposal,
+from sglang.srt.speculative.ragged_cuda_graph import (
+    bucket_key,
+    choose_suffix_width,
+    execution_widths,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     detect_nan,
@@ -56,6 +57,10 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     load_token_map,
     select_top_k_tokens,
+)
+from sglang.srt.speculative.suffix_proposer import (
+    SuffixDecodingProposer,
+    SuffixProposal,
 )
 from sglang.srt.utils import (
     empty_context,
@@ -124,16 +129,15 @@ class EAGLEWorker(TpModelWorker):
         self._dynamic_k_tier_request_counts: Dict[int, int] = {}
         self._ragged_verify_cuda_graph_batch_count = 0
         self._ragged_verify_varlen_cuda_graph_batch_count = 0
+        self._ragged_verify_bucket_cuda_graph_batch_count = 0
+        self._ragged_verify_bucket_real_token_count = 0
+        self._ragged_verify_bucket_padding_token_count = 0
         self._ragged_verify_eager_batch_count = 0
         self._ragged_cuda_graph_min_long_ratio = min(
             1.0,
             max(
                 0.0,
-                float(
-                    os.environ.get(
-                        "SGLANG_RAGGED_CUDA_GRAPH_MIN_LONG_RATIO", "1.0"
-                    )
-                ),
+                float(os.environ.get("SGLANG_RAGGED_CUDA_GRAPH_MIN_LONG_RATIO", "1.0")),
             ),
         )
         self._dynamic_k_enable = (
@@ -341,6 +345,9 @@ class EAGLEWorker(TpModelWorker):
         self._dynamic_k_tier_request_counts = {}
         self._ragged_verify_cuda_graph_batch_count = 0
         self._ragged_verify_varlen_cuda_graph_batch_count = 0
+        self._ragged_verify_bucket_cuda_graph_batch_count = 0
+        self._ragged_verify_bucket_real_token_count = 0
+        self._ragged_verify_bucket_padding_token_count = 0
         self._ragged_verify_eager_batch_count = 0
         if self._suffix_proposer:
             self._suffix_prepare_batch(batch)
@@ -368,7 +375,9 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context():
                 spec_info = self.draft(batch)
-            num_draft_tokens = self._get_num_verify_tokens(batch.batch_size(), spec_info)
+            num_draft_tokens = self._get_num_verify_tokens(
+                batch.batch_size(), spec_info
+            )
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
@@ -405,14 +414,15 @@ class EAGLEWorker(TpModelWorker):
                 dynamic_k_mixed_verify_batch_count=self._dynamic_k_mixed_verify_batch_count,
                 dynamic_k_normal_verify_call_count=self._dynamic_k_normal_verify_call_count,
                 dynamic_k_long_verify_call_count=self._dynamic_k_long_verify_call_count,
-                dynamic_k_tier_request_counts=dict(
-                    self._dynamic_k_tier_request_counts
-                ),
+                dynamic_k_tier_request_counts=dict(self._dynamic_k_tier_request_counts),
                 ragged_verify_cuda_graph_batch_count=self._ragged_verify_cuda_graph_batch_count,
                 ragged_verify_varlen_cuda_graph_batch_count=(
                     self._ragged_verify_varlen_cuda_graph_batch_count
                 ),
                 ragged_verify_eager_batch_count=self._ragged_verify_eager_batch_count,
+                ragged_verify_bucket_cuda_graph_batch_count=self._ragged_verify_bucket_cuda_graph_batch_count,
+                ragged_verify_bucket_real_token_count=self._ragged_verify_bucket_real_token_count,
+                ragged_verify_bucket_padding_token_count=self._ragged_verify_bucket_padding_token_count,
             )
 
     def _get_num_verify_tokens(
@@ -425,7 +435,9 @@ class EAGLEWorker(TpModelWorker):
         if isinstance(spec_info, DynamicKVerifyInput):
             total = 0
             if spec_info.normal is not None:
-                total += len(spec_info.normal_indices) * spec_info.normal.draft_token_num
+                total += (
+                    len(spec_info.normal_indices) * spec_info.normal.draft_token_num
+                )
             if spec_info.long_suffix is not None:
                 total += (
                     len(spec_info.long_suffix_indices)
@@ -517,9 +529,7 @@ class EAGLEWorker(TpModelWorker):
                 tokens = token_buffer[cursor : cursor + token_count]
                 cursor += token_count
                 self._suffix_proposer.add_accepted_tokens(req.rid, tokens)
-            self._suffix_proposer.stop_inactive_requests(
-                req.rid for req in batch.reqs
-            )
+            self._suffix_proposer.stop_inactive_requests(req.rid for req in batch.reqs)
         except Exception as exc:
             logger.warning("Suffix proposer update failed: %s", exc)
             self._suffix_proposer = None
@@ -536,9 +546,7 @@ class EAGLEWorker(TpModelWorker):
                 token_buffer = list(next_token_ids)
             for req, token_id in zip(batch.reqs, token_buffer):
                 self._suffix_proposer.add_accepted_tokens(req.rid, [int(token_id)])
-            self._suffix_proposer.stop_inactive_requests(
-                req.rid for req in batch.reqs
-            )
+            self._suffix_proposer.stop_inactive_requests(req.rid for req in batch.reqs)
         except Exception as exc:
             logger.warning("Suffix proposer extend update failed: %s", exc)
             self._suffix_proposer = None
@@ -589,11 +597,14 @@ class EAGLEWorker(TpModelWorker):
             )
             row[: torch_tokens.numel()] = torch_tokens
             if parent_list.numel() > 0:
-                parent_list[idx] = torch.arange(
-                    parent_list.size(1),
-                    dtype=parent_list.dtype,
-                    device=parent_list.device,
-                ) - 1
+                parent_list[idx] = (
+                    torch.arange(
+                        parent_list.size(1),
+                        dtype=parent_list.dtype,
+                        device=parent_list.device,
+                    )
+                    - 1
+                )
             seq_range = torch.arange(
                 top_scores_index.size(1),
                 dtype=top_scores_index.dtype,
@@ -649,8 +660,7 @@ class EAGLEWorker(TpModelWorker):
                 width, min_match = int(width_text), int(match_text)
             except ValueError as exc:
                 raise ValueError(
-                    "SGLANG_DYNAMIC_K_TIERS must be K:min_match pairs, "
-                    f"got {raw!r}"
+                    "SGLANG_DYNAMIC_K_TIERS must be K:min_match pairs, " f"got {raw!r}"
                 ) from exc
             if width <= self._normal_draft_token_num or min_match <= 0:
                 raise ValueError(
@@ -740,16 +750,15 @@ class EAGLEWorker(TpModelWorker):
         for idx, proposal in enumerate(proposals):
             if proposal is None:
                 continue
-            for width, min_match in reversed(eligible_tiers):
-                required_tokens = width - 1
-                if proposal.match_len < min_match:
-                    continue
-                if proposal.score < required_tokens:
-                    continue
-                if len(proposal.token_ids) < required_tokens:
-                    continue
+            width = choose_suffix_width(
+                proposal.match_len,
+                proposal.score,
+                len(proposal.token_ids),
+                eligible_tiers,
+                self._long_suffix_min_match_len,
+            )
+            if width is not None:
                 selected[idx] = width
-                break
 
         return selected
 
@@ -902,9 +911,7 @@ class EAGLEWorker(TpModelWorker):
         long_suffix_indices = list(suffix_draft_token_nums)
         long_mask = torch.zeros(bs, dtype=torch.bool, device=device)
         long_mask[long_suffix_indices] = True
-        widths = torch.full(
-            (bs,), normal_k, dtype=batch.seq_lens.dtype, device=device
-        )
+        widths = torch.full((bs,), normal_k, dtype=batch.seq_lens.dtype, device=device)
         for req_idx, width in suffix_draft_token_nums.items():
             widths[req_idx] = width
 
@@ -928,18 +935,16 @@ class EAGLEWorker(TpModelWorker):
         column_ids = torch.arange(max_k, device=device)
         valid_mask = column_ids.unsqueeze(0) < widths.unsqueeze(1)
         draft_token = padded_tokens[valid_mask]
-        positions = (
-            batch.seq_lens.unsqueeze(1).to(torch.long) + column_ids
-        )[valid_mask]
+        positions = (batch.seq_lens.unsqueeze(1).to(torch.long) + column_ids)[
+            valid_mask
+        ]
         ragged_cu_seqlens_q = torch.cat(
             [
                 torch.zeros(1, dtype=torch.int32, device=device),
                 torch.cumsum(widths, dim=0, dtype=torch.int32),
             ]
         )
-        padded_to_flat = torch.full(
-            (bs, max_k), -1, dtype=torch.long, device=device
-        )
+        padded_to_flat = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
         padded_to_flat[valid_mask] = torch.arange(
             draft_token.numel(), dtype=torch.long, device=device
         )
@@ -947,9 +952,9 @@ class EAGLEWorker(TpModelWorker):
         # Tree verification still uses a rectangular index table.  For a
         # topk=1 chain each node has at most one child; its actual model-token
         # location is recovered through ``padded_to_flat`` during verify.
-        padded_indices = torch.arange(
-            bs * max_k, dtype=torch.long, device=device
-        ).view(bs, max_k)
+        padded_indices = torch.arange(bs * max_k, dtype=torch.long, device=device).view(
+            bs, max_k
+        )
         retrive_index = torch.full_like(padded_indices, -1)
         retrive_index[valid_mask] = padded_indices[valid_mask]
         retrive_next_token = torch.full_like(padded_indices, -1)
@@ -974,6 +979,9 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_sum=batch.seq_lens.sum().item(),
             seq_lens_cpu=batch.seq_lens_cpu,
             ragged_draft_token_nums=widths,
+            ragged_draft_token_nums_cpu=[
+                suffix_draft_token_nums.get(i, normal_k) for i in range(bs)
+            ],
             ragged_cu_seqlens_q=ragged_cu_seqlens_q,
             ragged_padded_to_flat=padded_to_flat,
             ragged_long_suffix_mask=long_mask,
@@ -998,13 +1006,12 @@ class EAGLEWorker(TpModelWorker):
             and len(suffix_draft_token_nums) > 0
             and not batch.return_logprob
             and not batch.has_grammar
-            and (
-                batch.sampling_info is None
-                or batch.sampling_info.is_all_greedy
-            )
+            and (batch.sampling_info is None or batch.sampling_info.is_all_greedy)
         )
 
-    def _make_sub_batch(self, batch: ScheduleBatch, indices: List[int]) -> ScheduleBatch:
+    def _make_sub_batch(
+        self, batch: ScheduleBatch, indices: List[int]
+    ) -> ScheduleBatch:
         index_tensor = torch.tensor(indices, dtype=torch.long, device=batch.device)
         sub = dataclasses.replace(batch)
         sub.reqs = [batch.reqs[i] for i in indices]
@@ -1364,9 +1371,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
         proposals = self._get_suffix_proposals(batch)
-        suffix_draft_token_nums = self._select_suffix_draft_token_nums(
-            batch, proposals
-        )
+        suffix_draft_token_nums = self._select_suffix_draft_token_nums(batch, proposals)
         use_ragged_dynamic_k = self._can_use_ragged_dynamic_k(
             batch, suffix_draft_token_nums
         )
@@ -1376,14 +1381,11 @@ class EAGLEWorker(TpModelWorker):
         # verify forward unless every request in this batch qualifies for the
         # long suffix path.  Requests that fall back here can still receive a
         # regular K=4 suffix override below.
-        if (
-            not use_ragged_dynamic_k
-            and (
-                0 < len(suffix_draft_token_nums) < batch.batch_size()
-                or any(
-                    width != self._long_suffix_draft_token_num
-                    for width in suffix_draft_token_nums.values()
-                )
+        if not use_ragged_dynamic_k and (
+            0 < len(suffix_draft_token_nums) < batch.batch_size()
+            or any(
+                width != self._long_suffix_draft_token_num
+                for width in suffix_draft_token_nums.values()
             )
         ):
             suffix_draft_token_nums = {}
@@ -1447,9 +1449,7 @@ class EAGLEWorker(TpModelWorker):
             # Keep the long-suffix marker on the verify input so that the
             # common verify path counts long-only and mixed batches alike.
             long_suffix_input._is_dynamic_k_long_suffix = True
-            self._last_suffix_status = (
-                f"dynamic-k long={len(long_suffix_indices)} normal={len(normal_indices)}"
-            )
+            self._last_suffix_status = f"dynamic-k long={len(long_suffix_indices)} normal={len(normal_indices)}"
 
         if long_suffix_input is not None and normal_input is not None:
             return DynamicKVerifyInput(
@@ -1620,7 +1620,14 @@ class EAGLEWorker(TpModelWorker):
             self._dynamic_k_long_verify_call_count += 1
             if can_run_cuda_graph:
                 self._ragged_verify_cuda_graph_batch_count += 1
-                if getattr(spec_info, "ragged_cuda_graph_varlen", False):
+                if spec_info.ragged_bucket_num_tokens is not None:
+                    self._ragged_verify_bucket_cuda_graph_batch_count += 1
+                    real_tokens = spec_info.draft_token.numel()
+                    self._ragged_verify_bucket_real_token_count += real_tokens
+                    self._ragged_verify_bucket_padding_token_count += (
+                        spec_info.ragged_bucket_num_tokens - real_tokens
+                    )
+                elif getattr(spec_info, "ragged_cuda_graph_varlen", False):
                     self._ragged_verify_varlen_cuda_graph_batch_count += 1
             else:
                 self._ragged_verify_eager_batch_count += 1
@@ -1723,20 +1730,74 @@ class EAGLEWorker(TpModelWorker):
     def _maybe_enable_ragged_cuda_graph_padding(
         self, batch: ScheduleBatch, spec_info: EagleVerifyInput
     ) -> None:
-        """Pad high-K8-coverage ragged batches onto the existing K=8 graph."""
+        """Select fixed, finite-bucket, or legacy compact/padded graph replay."""
         if not getattr(spec_info, "is_ragged_verify", lambda: False)():
+            return
+        graph_runner = getattr(self.target_worker.model_runner, "graph_runner", None)
+        widths = spec_info.ragged_draft_token_nums_cpu
+        if widths is not None and len(set(widths)) == 1:
+            # This includes homogeneous high-batch K=8 fallback, independently
+            # of the configured low-batch long K=16.
+            if graph_runner is not None and graph_runner.can_run_ragged_target_verify(
+                batch.batch_size(), widths[0]
+            ):
+                spec_info.ragged_cuda_graph_padded = True
+            return
+        if self.server_args.speculative_ragged_cuda_graph:
+            config = getattr(graph_runner, "ragged_bucket_config", None)
+            if config is None or widths is None:
+                return
+            key = bucket_key(widths, self._normal_draft_token_num, config)
+            if key is None:
+                return
+            use_fixed = key[1] == key[0] * key[2]
+            if use_fixed:
+                if not graph_runner.can_run_ragged_target_verify(key[0], key[2]):
+                    return
+            elif not graph_runner.can_run_ragged_bucket_target_verify(key):
+                return
+            context_limit = min(
+                self.target_worker.model_runner.model_config.context_len,
+                batch.req_to_token_pool.req_to_token.shape[1],
+            )
+            capacities = [
+                context_limit - length for length in batch.seq_lens_cpu.tolist()
+            ]
+            physical = execution_widths(widths, key[1], key[2], capacities)
+            if physical is None:
+                return
+            # Extra graph-only slots must not force eviction or OOM. The eager
+            # path retains its normal allocator/eviction behavior.
+            if (
+                key[1] > sum(widths)
+                and key[1] > self.token_to_kv_pool_allocator.available_size()
+            ):
+                return
+            spec_info.ragged_bucket_num_tokens = key[1]
+            if use_fixed:
+                spec_info.ragged_cuda_graph_padded = True
+                return
+            spec_info.ragged_cuda_graph_varlen = True
+            spec_info.ragged_cuda_graph_bucket_key = key
+            spec_info.ragged_execution_token_nums = torch.tensor(
+                physical,
+                dtype=spec_info.ragged_draft_token_nums.dtype,
+                device=batch.device,
+            )
             return
         if not getattr(spec_info, "ragged_cuda_graph_eligible", True):
             return
         if self._long_suffix_draft_token_num <= self._normal_draft_token_num:
             return
         long_count = spec_info.ragged_long_suffix_count
-        graph_runner = getattr(self.target_worker.model_runner, "graph_runner", None)
         # Prefer an exact compact graph pattern. It keeps the flattened
         # variable-length Q tensor and real cu_seqlens_q; no K=4 tail is
         # padded to K=8.
-        if graph_runner is not None and graph_runner.can_run_ragged_varlen_target_verify(
-            batch.batch_size(), long_count
+        if (
+            graph_runner is not None
+            and graph_runner.can_run_ragged_varlen_target_verify(
+                batch.batch_size(), long_count
+            )
         ):
             spec_info.ragged_cuda_graph_varlen = True
             spec_info.ragged_cuda_graph_pattern_key = (
@@ -1753,9 +1814,7 @@ class EAGLEWorker(TpModelWorker):
             return
         spec_info.ragged_cuda_graph_padded = True
 
-    def _verify_dynamic_k(
-        self, batch: ScheduleBatch, spec_info: DynamicKVerifyInput
-    ):
+    def _verify_dynamic_k(self, batch: ScheduleBatch, spec_info: DynamicKVerifyInput):
         results = []
         self._dynamic_k_verify_batch_count += 1
         if spec_info.normal is not None and spec_info.long_suffix is not None:

@@ -25,6 +25,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleVerifyInputV2Mixin,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+from sglang.srt.speculative.ragged_cuda_graph import build_bucket_inputs
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -72,6 +73,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     # `ragged_draft_token_nums[i]` contiguous tokens in `draft_token` instead
     # of all requests sharing `draft_token_num`.
     ragged_draft_token_nums: Optional[torch.Tensor] = None
+    ragged_draft_token_nums_cpu: Optional[List[int]] = None
+    # Physical Q/KV lengths for bucket replay; the candidate lengths above
+    # remain authoritative for acceptance and request statistics.
+    ragged_execution_token_nums: Optional[torch.Tensor] = None
+    ragged_cuda_graph_bucket_key: Optional[Tuple[int, int, int]] = None
+    # Also set when the selected bucket reuses a full-width fixed-K graph.
+    ragged_bucket_num_tokens: Optional[int] = None
     ragged_cu_seqlens_q: Optional[torch.Tensor] = None
     ragged_padded_to_flat: Optional[torch.Tensor] = None
     ragged_long_suffix_mask: Optional[torch.Tensor] = None
@@ -85,9 +93,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     # width. A K=4/8/16 batch remains correct in eager FA3, but must not use
     # a binary-width graph pattern.
     ragged_cuda_graph_eligible: bool = True
-    # Exact-shape CUDA Graph for a compact K=4/K=8 query buffer. Unlike the
-    # padded graph path this keeps ``draft_token`` and ``cu_seqlens_q`` truly
-    # ragged, so no synthetic K=4 tail tokens are computed.
+    # Varlen FA3 graph replay: either a legacy exact compact pattern or a
+    # finite bucket with separate real-candidate and physical query lengths.
     ragged_cuda_graph_varlen: bool = False
     ragged_cuda_graph_pattern_key: Optional[Tuple[int, int]] = None
 
@@ -101,6 +108,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     def is_ragged_verify(self) -> bool:
         return self.ragged_draft_token_nums is not None
+
+    def get_ragged_execution_widths(self):
+        return (
+            self.ragged_execution_token_nums
+            if self.ragged_execution_token_nums is not None
+            else self.ragged_draft_token_nums
+        )
+
+    def get_ragged_metadata_key(self):
+        if self.ragged_cuda_graph_bucket_key is not None:
+            return ("bucket", *self.ragged_cuda_graph_bucket_key)
+        return self.ragged_cuda_graph_pattern_key
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
@@ -144,7 +163,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             assert page_size == 1
             end_offset = batch.seq_lens + self.ragged_draft_token_nums
 
-            if self.ragged_cuda_graph_padded:
+            if self.ragged_cuda_graph_bucket_key is not None:
+                assert self.ragged_padded_to_flat is not None
+                self.ragged_padded_to_draft_flat = self.ragged_padded_to_flat
+                (
+                    batch.input_ids,
+                    self.positions,
+                    self.ragged_cu_seqlens_q,
+                    self.ragged_padded_to_flat,
+                ) = build_bucket_inputs(
+                    self.draft_token,
+                    self.ragged_padded_to_draft_flat,
+                    self.ragged_draft_token_nums,
+                    self.ragged_execution_token_nums,
+                    batch.seq_lens,
+                )
+                end_offset = batch.seq_lens + self.ragged_execution_token_nums
+            elif self.ragged_cuda_graph_padded:
                 # CUDA Graph needs a fixed ``bs * max_k`` input shape. Pad
                 # only after each row's real candidate chain. Causal FA keeps
                 # real-prefix logits unchanged; synthetic tails are freed by
@@ -705,9 +740,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
         candidates = torch.full_like(target_predict, -1)
         target_predict[valid_mask] = target_predict_flat[padded_to_flat[valid_mask]]
-        candidates[valid_mask] = self.draft_token[
-            draft_padded_to_flat[valid_mask]
-        ]
+        candidates[valid_mask] = self.draft_token[draft_padded_to_flat[valid_mask]]
 
         # The CUDA tree verifier indexes predictions in one flattened buffer
         # (the regular fixed-K path allocates ``bs * K + 1`` as well). Only

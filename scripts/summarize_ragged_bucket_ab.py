@@ -8,6 +8,7 @@ from pathlib import Path
 from statistics import median
 
 from summarize_dynamic_k_experiment import (
+    METRICS,
     parse_measurement_log,
     read_snapshot,
     subtract,
@@ -30,7 +31,10 @@ def summarize(root):
         after = run / f"metrics_after_measurement_bs{bs}.prom"
         if not before.exists() or not after.exists():
             raise ValueError(f"Missing per-phase metrics: {path}")
-        delta = subtract(read_snapshot(after), read_snapshot(before))
+        delta = subtract(
+            read_snapshot(after, required_metrics=METRICS),
+            read_snapshot(before, required_metrics=METRICS),
+        )
         row["graph_batches"] = delta[
             "sglang:ragged_verify_bucket_cuda_graph_batch_total"
         ]

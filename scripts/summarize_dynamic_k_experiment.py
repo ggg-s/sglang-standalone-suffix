@@ -46,10 +46,13 @@ CONFIG_ORDER = (
 )
 
 
-def read_snapshot(path: Path) -> dict[str, float]:
+def read_snapshot(path: Path, *, required_metrics=()) -> dict[str, float]:
     values = {metric: 0.0 for metric in METRICS}
     if not path.exists():
+        if required_metrics:
+            raise ValueError(f"Missing metrics snapshot: {path}")
         return values
+    seen = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#"):
             continue
@@ -66,7 +69,15 @@ def read_snapshot(path: Path) -> dict[str, float]:
         # does not expose tp_rank, retain its unlabeled sample.
         if rank is not None and rank.group(1) != "0":
             continue
+        seen.add(metric)
         values[metric] += value
+    missing = set(required_metrics) - seen
+    if missing:
+        raise ValueError(
+            f"Missing TP0/unlabeled metric samples in {path}: {', '.join(sorted(missing))}. "
+            "Absent metrics are not zero counts; check the running code, launch flags "
+            "and scheduler metrics export before interpreting graph replay rates."
+        )
     return values
 
 

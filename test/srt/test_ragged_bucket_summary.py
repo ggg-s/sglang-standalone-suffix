@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from summarize_dynamic_k_experiment import METRICS, read_snapshot
 from summarize_ragged_bucket_ab import summarize
 
 
@@ -21,14 +22,17 @@ class BucketSummaryTests(unittest.TestCase):
         )
 
         def metrics(batch, real, padding):
-            values = {
-                "ragged_verify_bucket_cuda_graph_batch": batch,
-                "ragged_verify_bucket_real_token": real,
-                "ragged_verify_bucket_padding_token": padding,
-            }
+            values = dict.fromkeys(METRICS, 0)
+            values.update(
+                {
+                    "sglang:ragged_verify_bucket_cuda_graph_batch_total": batch,
+                    "sglang:ragged_verify_bucket_real_token_total": real,
+                    "sglang:ragged_verify_bucket_padding_token_total": padding,
+                }
+            )
             return "".join(
-                f'sglang:{name}_total{{tp_rank="0"}} {value}\n'
-                f'sglang:{name}_total{{tp_rank="1"}} {value * 100}\n'
+                f'{name}{{tp_rank="0"}} {value}\n'
+                f'{name}{{tp_rank="1"}} {value * 100}\n'
                 for name, value in values.items()
             )
 
@@ -56,6 +60,37 @@ class BucketSummaryTests(unittest.TestCase):
             self.make_run(root, "bucket", 110, completed=39)
             with self.assertRaisesRegex(ValueError, "Incomplete or failed"):
                 summarize(root)
+
+    def test_missing_custom_metrics_are_not_reported_as_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_run(root, "eager", 100)
+            run = self.make_run(root, "bucket", 105)
+            snapshot = run / "metrics_after_measurement_bs10.prom"
+            # Reproduce a valid scrape with tokenizer counters but no custom samples.
+            snapshot.write_text(
+                'sglang:prompt_tokens_total{model_name="model"} 1552380\n'
+            )
+            with self.assertRaisesRegex(ValueError, "Absent metrics are not zero"):
+                summarize(root)
+
+    def test_explicit_zero_is_valid_but_wrong_rank_or_comments_are_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "metrics.prom"
+            metric = METRICS[0]
+            for labels in ('{tp_rank="0"}', ""):
+                snapshot.write_text(f"{metric}{labels} 0\n")
+                self.assertEqual(
+                    read_snapshot(snapshot, required_metrics=[metric])[metric], 0
+                )
+            for content in (
+                f'{metric}{{tp_rank="1"}} 3\n',
+                f"# HELP {metric} help\n",
+                "",
+            ):
+                snapshot.write_text(content)
+                with self.assertRaisesRegex(ValueError, "Missing TP0/unlabeled"):
+                    read_snapshot(snapshot, required_metrics=[metric])
 
 
 if __name__ == "__main__":

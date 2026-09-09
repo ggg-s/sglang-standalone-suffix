@@ -78,15 +78,12 @@ require_file() {
 }
 
 cleanup_server() {
-    if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-        echo "Stopping server pid=${SERVER_PID}"
-        kill "${SERVER_PID}" 2>/dev/null || true
-        wait "${SERVER_PID}" 2>/dev/null || true
-    fi
-    SERVER_PID=""
+    stop_benchmark_server
 }
 
-trap cleanup_server EXIT INT TERM
+trap cleanup_server EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 should_run_experiment() {
     local experiment="$1"
@@ -103,6 +100,18 @@ snapshot_metrics() {
     local name="$1"
     curl --noproxy "${NO_PROXY}" --connect-timeout 3 --max-time 30 \
         --fail --silent --show-error "${CLIENT_BASE_URL}/metrics" > "${CURRENT_DIR}/metrics_${name}.prom"
+    if [[ "${CURRENT_DIR##*/}" == "${DYNAMIC_EXPERIMENT_NAME}" ]]; then
+        # Validate before warmup/measurement, not after an entire expensive A/B run.
+        python - "${SGLANG_DIR}/scripts" "${CURRENT_DIR}/metrics_${name}.prom" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from summarize_dynamic_k_experiment import METRICS, read_snapshot
+
+read_snapshot(Path(sys.argv[2]), required_metrics=METRICS)
+PY
+    fi
     grep -E '^sglang:(suffix_|dynamic_k|ragged_|spec_accept_)' "${CURRENT_DIR}/metrics_${name}.prom" \
         > "${CURRENT_DIR}/metrics_${name}_focus.prom" || true
 }
@@ -142,6 +151,7 @@ start_server() {
     shift
     CURRENT_DIR="${RESULTS_DIR}/${experiment}"
     mkdir -p "${CURRENT_DIR}"
+    check_benchmark_port
 
     local args=(
         python -m sglang.launch_server
@@ -171,7 +181,8 @@ start_server() {
     printf '\n' >> "${CURRENT_DIR}/server_command.sh"
     (
         cd "${SGLANG_DIR}"
-        "${args[@]}"
+        # Track the actual launcher PID and put only this run in its own group.
+        exec python -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "${args[@]}"
     ) > "${CURRENT_DIR}/server.log" 2>&1 &
     SERVER_PID=$!
     wait_for_server

@@ -20,6 +20,39 @@ configure_benchmark_http() {
     export no_proxy="${NO_PROXY}"
 }
 
+check_benchmark_port() {
+    python - "${HOST}" "${PORT}" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+with socket.socket(family, socket.SOCK_STREAM) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        raise SystemExit(
+            f"Cannot bind benchmark server at {host}:{port}: {exc}. "
+            "Stop the existing server or choose a free PORT before benchmarking."
+        ) from exc
+PY
+}
+
+stop_benchmark_server() {
+    if [[ -z "${SERVER_PID:-}" ]]; then return; fi
+    local deadline=$((SECONDS + 10))
+    echo "Stopping benchmark process group ${SERVER_PID}"
+    # The launcher creates its own session: never kill by process name or port.
+    kill -TERM -- "-${SERVER_PID}" 2>/dev/null || kill "${SERVER_PID}" 2>/dev/null || true
+    while kill -0 -- "-${SERVER_PID}" 2>/dev/null && (( SECONDS < deadline )); do
+        sleep 1
+    done
+    kill -KILL -- "-${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    SERVER_PID=""
+}
+
 wait_for_server() {
     require_benchmark_curl || return $?
     local deadline=$((SECONDS + SERVER_START_TIMEOUT))
@@ -46,6 +79,11 @@ wait_for_server() {
             return "${rc}"
         fi
         if [[ "${rc}" == 0 && "${code}" == 200 ]]; then
+            if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+                echo "Launched server exited during health check; refusing to benchmark another listener." >&2
+                tail -n 40 "${CURRENT_DIR}/server.log" >&2 || true
+                return 1
+            fi
             echo "Server ready: ${CLIENT_BASE_URL}/health returned HTTP 200"
             return 0
         fi

@@ -367,6 +367,26 @@ class SchedulerMetricsCollector:
             documentation="Ragged dynamic-K target verify batches executed eagerly.",
             labelnames=labels.keys(),
         )
+        # Export explicit zeros even before a suffix/bucket event occurs. Otherwise
+        # missing scheduler metrics are indistinguishable from unused features.
+        for metric in (
+            self.suffix_proposal_total,
+            self.suffix_override_total,
+            self.dynamic_k8_request_total,
+            self.dynamic_k8_output_token_total,
+            self.dynamic_k8_draft_token_total,
+            self.dynamic_k_verify_batch_total,
+            self.dynamic_k_mixed_verify_batch_total,
+            self.dynamic_k_normal_verify_call_total,
+            self.dynamic_k_long_verify_call_total,
+            self.ragged_verify_cuda_graph_batch_total,
+            self.ragged_verify_varlen_cuda_graph_batch_total,
+            self.ragged_verify_bucket_cuda_graph_batch_total,
+            self.ragged_verify_bucket_real_token_total,
+            self.ragged_verify_bucket_padding_token_total,
+            self.ragged_verify_eager_batch_total,
+        ):
+            metric.labels(**self.labels).inc(0)
 
         # Retract
         self.num_retracted_reqs = Gauge(

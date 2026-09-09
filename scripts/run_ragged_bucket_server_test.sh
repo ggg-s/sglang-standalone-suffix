@@ -19,8 +19,8 @@ check_zmq_runtime
 
 export GPU_IDS="${GPU_IDS:-0,1,2,3}"
 export TP_SIZE="${TP_SIZE:-4}"
-export MODEL_PATH="${MODEL_PATH:-/models/models/Qwen/Qwen2.5-72B-Instruct-AWQ}"
-export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/models/models/Qwen/Qwen3-0.6B}"
+export MODEL_PATH="${MODEL_PATH:-/models/Qwen/Qwen2.5-72B-Instruct-AWQ}"
+export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/models/Qwen/Qwen3-0.6B}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 
 export SPEC_FORGE_DIR="${SPEC_FORGE_DIR:-/workspace/SpecForge}"

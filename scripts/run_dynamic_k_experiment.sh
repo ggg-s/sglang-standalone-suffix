@@ -44,6 +44,7 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-fa3}"
 HIGH_BS_THRESHOLD="${HIGH_BS_THRESHOLD:-24}"
 DYNAMIC_LONG_DRAFT_TOKENS="${DYNAMIC_LONG_DRAFT_TOKENS:-8}"
 RAGGED_CUDA_GRAPH="${RAGGED_CUDA_GRAPH:-0}"
+SUFFIX_SKIP_DRAFT="${SUFFIX_SKIP_DRAFT:-0}"
 RAGGED_GRAPH_MAX_BS="${RAGGED_GRAPH_MAX_BS:-32}"
 RAGGED_GRAPH_TOKEN_MULTIPLE="${RAGGED_GRAPH_TOKEN_MULTIPLE:-16}"
 RAGGED_GRAPH_MAX_PADDING_RATIO="${RAGGED_GRAPH_MAX_PADDING_RATIO:-0.125}"
@@ -177,6 +178,13 @@ start_server() {
     fi
     args+=("$@")
 
+    if [[ "${experiment}" == "${DYNAMIC_EXPERIMENT_NAME}" && "${SUFFIX_SKIP_DRAFT}" == "1" ]]; then
+        args+=(--speculative-suffix-skip-draft)
+    fi
+    if [[ " ${args[*]} " == *" --speculative-suffix-enable "* && "${SUFFIX_BACKEND}" == "arctic" ]]; then
+        # Surface missing/incompatible native extensions before model loading.
+        python -c 'from arctic_inference.suffix_decoding import SuffixDecodingCache, SuffixDecodingDraft'
+    fi
     printf '%q ' "${args[@]}" > "${CURRENT_DIR}/server_command.sh"
     printf '\n' >> "${CURRENT_DIR}/server_command.sh"
     (

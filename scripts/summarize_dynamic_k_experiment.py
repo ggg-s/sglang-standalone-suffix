@@ -7,6 +7,10 @@ import argparse
 import re
 from pathlib import Path
 
+SKIP_DRAFT_METRICS = (
+    "sglang:suffix_draft_skipped_request_total",
+    "sglang:suffix_draft_skipped_batch_total",
+)
 METRICS = (
     "sglang:suffix_proposal_total",
     "sglang:suffix_override_total",
@@ -47,7 +51,7 @@ CONFIG_ORDER = (
 
 
 def read_snapshot(path: Path, *, required_metrics=()) -> dict[str, float]:
-    values = {metric: 0.0 for metric in METRICS}
+    values = {metric: 0.0 for metric in METRICS + SKIP_DRAFT_METRICS}
     if not path.exists():
         if required_metrics:
             raise ValueError(f"Missing metrics snapshot: {path}")
@@ -82,7 +86,7 @@ def read_snapshot(path: Path, *, required_metrics=()) -> dict[str, float]:
 
 
 def subtract(after: dict[str, float], before: dict[str, float]) -> dict[str, float]:
-    return {metric: after[metric] - before[metric] for metric in METRICS}
+    return {metric: after[metric] - before[metric] for metric in METRICS + SKIP_DRAFT_METRICS}
 
 
 def parse_measurement_log(path: Path) -> dict[str, float | int] | None:
@@ -248,6 +252,7 @@ def main() -> None:
         "\tk8_output_tokens\tk8_draft_tokens\tk8_efficiency"
         "\tdynamic_batches\tmixed_batches\tk4_verify_calls\tlong_verify_calls"
         "\tvarlen_graph_batches\tbucket_graph_batches\tbucket_real_tokens\tbucket_padding_tokens"
+        "\tdraft_skipped_requests\tdraft_skipped_batches"
     )
     dynamic_probe: dict[str, float] | None = None
     for experiment_dir in sorted(
@@ -303,6 +308,8 @@ def main() -> None:
                 f"\t{delta['sglang:ragged_verify_bucket_cuda_graph_batch_total']:.0f}"
                 f"\t{delta['sglang:ragged_verify_bucket_real_token_total']:.0f}"
                 f"\t{delta['sglang:ragged_verify_bucket_padding_token_total']:.0f}"
+                f"\t{delta['sglang:suffix_draft_skipped_request_total']:.0f}"
+                f"\t{delta['sglang:suffix_draft_skipped_batch_total']:.0f}"
             )
             if experiment_dir.name == "dynamic_k4_k8" and phase == "k8_probe":
                 dynamic_probe = delta

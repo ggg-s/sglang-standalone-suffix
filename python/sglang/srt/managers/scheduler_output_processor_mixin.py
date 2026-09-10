@@ -329,6 +329,8 @@ class SchedulerOutputProcessorMixin:
                     result.ragged_verify_bucket_cuda_graph_batch_count,
                     result.ragged_verify_bucket_real_token_count,
                     result.ragged_verify_bucket_padding_token_count,
+                    suffix_draft_skipped_request_count=result.suffix_draft_skipped_request_count,
+                    suffix_draft_skipped_batch_count=result.suffix_draft_skipped_batch_count,
                 )
 
         self.token_to_kv_pool_allocator.free_group_begin()

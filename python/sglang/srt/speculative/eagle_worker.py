@@ -331,6 +331,8 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         # reset per-batch suffix status
+        self._suffix_draft_skipped_request_count = 0
+        self._suffix_draft_skipped_batch_count = 0
         self._last_suffix_status = None
         self._suffix_proposal_count = 0
         self._suffix_source_proposal_counts = {}
@@ -404,6 +406,8 @@ class EAGLEWorker(TpModelWorker):
                 num_draft_tokens=num_draft_tokens,
                 can_run_cuda_graph=can_run_cuda_graph,
                 suffix_status=self._last_suffix_status,
+                suffix_draft_skipped_request_count=self._suffix_draft_skipped_request_count,
+                suffix_draft_skipped_batch_count=self._suffix_draft_skipped_batch_count,
                 suffix_proposal_count=self._suffix_proposal_count,
                 suffix_source_proposal_counts=dict(self._suffix_source_proposal_counts),
                 suffix_override_count=self._suffix_override_count,
@@ -1322,7 +1326,7 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
-    def draft(self, batch: ScheduleBatch):
+    def _draft_model_candidates(self, batch: ScheduleBatch):
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -1363,6 +1367,71 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
 
+        return parent_list, top_scores_index, draft_tokens
+
+    def _draft_suffix_first_candidates(self, batch, suffix_draft_token_nums):
+        """Draft only fallback rows; suffix rows are replaced before verification.
+
+        The temporary allocation in draft preprocessing is restored as usual.
+        Target verification allocates its own slots, and the unchanged draft
+        extend after verification populates KV for ALL accepted sequences.
+        """
+        indices = [
+            i for i in range(batch.batch_size()) if i not in suffix_draft_token_nums
+        ]
+        device = batch.seq_lens.device
+        slots = self.speculative_num_draft_tokens - 1
+        tokens = torch.zeros(
+            (batch.batch_size(), slots),
+            dtype=batch.spec_info.topk_index.dtype,
+            device=device,
+        )
+        parents = torch.arange(slots, device=device).expand(batch.batch_size(), -1) - 1
+        scores = torch.arange(slots, device=device).expand(batch.batch_size(), -1).clone()
+        if indices:
+            sub = self._make_sub_batch(batch, indices)
+            sub.spec_info = copy.copy(batch.spec_info)
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+            sub.spec_info.filter_batch(index_tensor, has_been_filtered=False)
+            sub.input_ids = sub.spec_info.verified_id
+            _, _, fallback_tokens = self._draft_model_candidates(sub)
+            tokens[index_tensor] = fallback_tokens
+        self._suffix_draft_skipped_request_count = len(suffix_draft_token_nums)
+        self._suffix_draft_skipped_batch_count = 1
+        return parents, scores, tokens
+
+    def draft(self, batch: ScheduleBatch):
+        # Query before draft preprocessing so accepted suffix candidates can
+        # avoid both speculative slot setup and autoregressive draft forwards.
+        proposals = None
+        suffix_draft_token_nums = {}
+        use_ragged_dynamic_k = False
+        if not batch.forward_mode.is_idle():
+            proposals = self._get_suffix_proposals(batch)
+            suffix_draft_token_nums = self._select_suffix_draft_token_nums(batch, proposals)
+            use_ragged_dynamic_k = self._can_use_ragged_dynamic_k(
+                batch, suffix_draft_token_nums
+            )
+        # Limit compaction to the standalone greedy FA3/page-1 path.
+        # DP ranks must execute matching collectives, even on suffix-only ranks.
+        skip_draft = (
+            getattr(self.server_args, "speculative_suffix_skip_draft", False)
+            and self.speculative_algorithm.is_standalone()
+            and use_ragged_dynamic_k
+            and not self.server_args.enable_dp_attention
+            and getattr(self.server_args, "dp_size", 1) == 1
+            and getattr(self.server_args, "pp_size", 1) == 1
+            and not getattr(self.model_config, "is_encoder_decoder", False)
+            and batch.spec_info.future_indices is None
+            and not batch.sampling_info.penalizer_orchestrator.is_required
+        )
+        if skip_draft:
+            parent_list, top_scores_index, draft_tokens = self._draft_suffix_first_candidates(
+                batch, suffix_draft_token_nums
+            )
+        else:
+            parent_list, top_scores_index, draft_tokens = self._draft_model_candidates(batch)
+
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
@@ -1370,11 +1439,6 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_draft_tokens,
             )
 
-        proposals = self._get_suffix_proposals(batch)
-        suffix_draft_token_nums = self._select_suffix_draft_token_nums(batch, proposals)
-        use_ragged_dynamic_k = self._can_use_ragged_dynamic_k(
-            batch, suffix_draft_token_nums
-        )
         # A mixed K=4/K=8 batch needs two serial target verify forwards and a
         # merge.  The measured split overhead is larger than the K=8 benefit
         # for the current 10--24 concurrency workload.  Keep a single target

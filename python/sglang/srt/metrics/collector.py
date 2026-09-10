@@ -284,6 +284,16 @@ class SchedulerMetricsCollector:
             documentation="The number of suffix cache proposals returned by the suffix proposer.",
             labelnames=labels.keys(),
         )
+        self.suffix_draft_skipped_request_total = Counter(
+            name="sglang:suffix_draft_skipped_request_total",
+            documentation="Request decode steps using suffix candidates without draft generation.",
+            labelnames=labels.keys(),
+        )
+        self.suffix_draft_skipped_batch_total = Counter(
+            name="sglang:suffix_draft_skipped_batch_total",
+            documentation="Decode batches skipping draft generation for at least one suffix row.",
+            labelnames=labels.keys(),
+        )
         self.suffix_proposal_source_total = Counter(
             name="sglang:suffix_proposal_source_total",
             documentation="Suffix proposals selected from each suffix-cache tree.",
@@ -371,6 +381,8 @@ class SchedulerMetricsCollector:
         # missing scheduler metrics are indistinguishable from unused features.
         for metric in (
             self.suffix_proposal_total,
+            self.suffix_draft_skipped_request_total,
+            self.suffix_draft_skipped_batch_total,
             self.suffix_override_total,
             self.dynamic_k8_request_total,
             self.dynamic_k8_output_token_total,
@@ -710,9 +722,13 @@ class SchedulerMetricsCollector:
         ragged_verify_bucket_cuda_graph_batch_count: int = 0,
         ragged_verify_bucket_real_token_count: int = 0,
         ragged_verify_bucket_padding_token_count: int = 0,
+        suffix_draft_skipped_request_count: int = 0,
+        suffix_draft_skipped_batch_count: int = 0,
     ) -> None:
         """Publish cumulative suffix/dynamic-K counters for one scheduler batch."""
         metric_values = (
+            (self.suffix_draft_skipped_request_total, suffix_draft_skipped_request_count),
+            (self.suffix_draft_skipped_batch_total, suffix_draft_skipped_batch_count),
             (
                 self.ragged_verify_bucket_cuda_graph_batch_total,
                 ragged_verify_bucket_cuda_graph_batch_count,

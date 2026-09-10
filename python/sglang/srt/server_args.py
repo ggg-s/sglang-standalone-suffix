@@ -394,6 +394,7 @@ class ServerArgs:
     speculative_long_suffix_draft_token_num: int = 8
     speculative_long_suffix_min_match_len: int = 23
     speculative_high_bs_threshold: int = 10
+    speculative_suffix_skip_draft: bool = False
     speculative_ragged_cuda_graph: bool = False
     speculative_ragged_cuda_graph_max_bs: int = 32
     speculative_ragged_cuda_graph_token_multiple: int = 16
@@ -2995,6 +2996,12 @@ class ServerArgs:
             help="Running batch size threshold at which dynamic-K falls back to the normal verify width.",
         )
         # Ngram speculative decoding
+        parser.add_argument(
+            "--speculative-suffix-skip-draft",
+            action="store_true",
+            default=ServerArgs.speculative_suffix_skip_draft,
+            help="Skip standalone draft generation for eligible greedy FA3 suffix rows; retain target verification and draft extend.",
+        )
         parser.add_argument(
             "--speculative-ragged-cuda-graph",
             action="store_true",

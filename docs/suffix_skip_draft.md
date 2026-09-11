@@ -17,6 +17,9 @@ future state, and decoder-only models. Other paths retain normal drafting.
 
 ## Validation
 
+Reported server measurements and explicitly hypothetical throughput/TPOT scenarios
+are documented in [性能结果与假设收益测算](suffix_skip_draft_performance.md).
+
 CPU control-flow and mapping tests:
 
 ```bash
